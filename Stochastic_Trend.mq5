@@ -359,7 +359,10 @@ datetime DayStartOf(const datetime t)
 
 int TripleSwapRolloverDow()
   {
-   return (int)SymbolInfoInteger(_Symbol, SYMBOL_SWAP_ROLLOVER3DAY);
+   long rollover = 3;
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_SWAP_ROLLOVER3DAYS, rollover))
+      return 3;
+   return (int)rollover;
   }
 
 string TripleSwapDowName(const int dow)

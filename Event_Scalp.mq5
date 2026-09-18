@@ -1,19 +1,16 @@
 //+------------------------------------------------------------------+
 //|                                                   Event_Scalp.mq5 |
-//|  M5 scalp: news + rapid impulse on the same candle.               |
-//|  Rapid: long bar = range vs ATR, entry on the same candle.        |
-//|  Exit: ATR SL/TP, BE, trail M1, MaxBarsHold (Rapid/News).         |
+//|  M15 impulse: large forming candle, pullback fill.                |
+//|  Closed-bar ADX/ATR. H1 optional. No tick-burst / z-score.        |
 //+------------------------------------------------------------------+
 #property copyright "My robots"
-#property version   "2.11"
+#property version   "2.27"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 #define SLIPPAGE_POINTS      30
 #define MAX_POSITIONS_CAP    20
-#define NEWS_HTTP_TIMEOUT_MS 4000
-#define NEWS_MAX_PAGES       50
 #define ATR_PERIOD           14
 
 enum ENUM_SESSION_CLOCK
@@ -24,44 +21,41 @@ enum ENUM_SESSION_CLOCK
   };
 
 //==================== SIGNALS =======================================
-input group "=== Sygnaly ==="
-input bool            InpUseNewsSignal    = true;   // News (primary)
-input bool            InpUseRapidBar      = true;   // Rapid bar (ATR)
-input bool            InpNewsRequireRapid = false;  // News only with matching Rapid
-
 input group "=== Rapid bar ==="
-input double          InpRapidAtrMult     = 1.0;    // Min. candle RANGE = ATR * this
-input double          InpRapidAtrMax      = 0.2;    // Skip when range >= ATR * this (0=off; < min = off)
-input int             InpRapidMinPoints   = 40;     // Min. range in points (0=off)
-input double          InpRapidBodyRatio   = 0.55;   // Min. |close-open| / range (0=off)
-input double          InpRapidClosePos    = 0.10;   // Close in the last X of the range (0=off)
-input double          InpRapidPullbackMin = 0.30;   // Enter after pullback (0=immediately on the bar)
-input double          InpRapidPullbackMax = 0.55;   // Too deep pullback = abort
-input bool            InpRapidUseM1       = true;   // M1 confirmation
-input int             InpRapidM1Bars      = 2;      // How many M1 bars in direction (0 = current)
+input bool            InpUseRapidBar      = true;   // Rapid bar (ATR)
+input double          InpRapidAtrMult     = 1.2;    // Min. candle RANGE = ATR * this
+input double          InpRapidAtrMax      = 4.0;    // Skip when range >= ATR * this (0=off; < min = off)
+input int             InpRapidMinPoints   = 70;     // Min. range in points (0=off)
+input double          InpRapidBodyRatio   = 0.60;   // Min. |close-open| / range (0=off)
+input double          InpRapidClosePos    = 0.30;   // Close in the last X of the range (0=off)
+input double          InpRapidPullbackMin = 0.50;   // Enter after pullback (0=immediately on the bar)
+input double          InpRapidPullbackMax = 0.60;   // Too deep pullback = abort
+input bool            InpRapidUseM1       = false;  // M1 confirmation (closed bars only)
+input int             InpRapidM1Bars      = 1;      // Closed M1 bars in direction (0 = last closed)
 input int             InpRapidVelocitySec = 0;      // 0=off. Max seconds from bar open
 input double          InpRapidVelocityAtr = 0.70;   // ATR required to count as velocity
-input bool            InpRapidAbortWick   = true;   // Close Rapid when a wick reverses the bar
+input bool            InpRapidAbortWick   = false;  // Close Rapid when a wick reverses the bar
 input double          InpRapidAbortBody   = 0.35;   // Abort when body < this and close crosses open
+input int             InpRapidAbortSec    = 15;     // Wick must hold this many seconds (0=first tick)
 
 input group "=== Trade ==="
 input double          InpLots             = 0.10;   // Lot
 input bool            InpUseAtrStops      = true;   // SL/TP from ATR (otherwise points)
-input double          InpSlAtrMult        = 1.3;    // SL = ATR * this
-input double          InpTpAtrMult        = 2.0;    // TP = ATR * this
-input bool            InpUseStructSl      = false;  // SL beyond current M5 low/high
+input double          InpSlAtrMult        = 1.4;    // SL = ATR * this
+input double          InpTpAtrMult        = 1.3;    // TP = ATR * this
+input bool            InpUseStructSl      = false;  // SL beyond current TF low/high
 input int             InpStopLossPoints   = 400;    // SL fallback (SYMBOL_POINT)
 input int             InpTakeProfitPoints = 500;    // TP fallback
 input double          InpBeAtrMult        = 0.50;   // BE after +ATR*this (0=off)
-input double          InpTrailAtrMult     = 0.10;   // Trail ATR (0=off)
+input double          InpTrailAtrMult     = 0.0;    // Trail ATR (0=off); never below BE
 input bool            InpTrailM1          = false;  // Trail behind M1 swing
-input double          InpSpreadMaxPctSl   = 0.0;    // Skip when spread > % of SL (0=off)
-input int             InpMaxPositions     = 4;      // Max open positions
-input int             InpMaxBarsHold      = 7;      // Hold Rapid (TF bars)
-input int             InpMaxBarsHoldNews  = 5;      // Hold News (TF bars)
+input double          InpSpreadMaxPctSl   = 0.15;   // Skip when spread > % of SL (0=off)
+input double          InpMinTpSpreadMult  = 5.0;    // Skip when TP < spread * this (0=off)
+input int             InpMaxPositions     = 3;      // Max open positions
+input int             InpMaxBarsHold      = 3;      // Hold (TF bars)
 input int             InpCooldownBars     = 0;      // Pause after open (bars)
 input int             InpCooldownAfterSL  = 1;      // Pause after SL (bars)
-input int             InpNewsConfirmBars  = 4;      // News waits for Rapid (bars)
+input double          InpMaxDailyLossPct  = 2.0;    // Halt NEW entries after this-EA loss % today (0=off)
 
 // Hours are inclusive (8 and 17 = 08:00-17:59). End < start wraps midnight.
 input group "=== Session hours ==="
@@ -73,34 +67,27 @@ input bool            InpUseSession2      = true;   // Second window (NY overlap
 input int             InpSession2StartHour = 13;    // Window 2 start hour 0-23 (NY ~13)
 input int             InpSession2EndHour  = 21;     // Window 2 end hour 0-23 inclusive
 
-input group "=== News API ==="
-input string          InpNewsApiUrl       = "";     // GET URL
-input string          InpNewsApiToken     = "";     // Bearer
-input int             InpNewsPollSeconds  = 5;      // Poll (s)
-input datetime        InpNewsBackfillFrom = D'2026.01.01 00:00:00'; // History from
-input double          InpNewsFlipLotMult  = 1.5;    // Lot after pos<->neg flip
+// Closed-bar only. Do not add tick-burst / z-score (loses on real ticks).
+input group "=== Regime ==="
+input bool            InpUseAdxFilter     = true;   // Skip chop (closed ADX)
+input int             InpAdxPeriod        = 14;     // ADX period
+input double          InpAdxMin           = 18.0;   // Min ADX (below = chop)
+input bool            InpAdxMustRise      = false;  // Require ADX rising vs prior bar
+input bool            InpAdxUseDi         = false;  // +DI/-DI must match Rapid side
+input bool            InpUseH1Ema         = false;  // Only with closed H1 EMA (off: more Rapid fills)
+input int             InpH1EmaPeriod      = 50;     // H1 EMA period
+input bool            InpUseAtrRegime     = true;   // Skip when ATR is compressed
+input int             InpAtrAvgBars       = 50;     // Bars to average ATR
+input double          InpMinAtrRatio      = 0.55;   // Current ATR / avg ATR (0=off)
 
 input group "=== Ogolne ==="
 input ulong           InpMagic            = 26091401;
-input ENUM_TIMEFRAMES InpTimeframe        = PERIOD_M5;
+input ENUM_TIMEFRAMES InpTimeframe        = PERIOD_M15;
 input bool            InpShowComments     = true;
 
-enum ENUM_NEWS_SENT
-  {
-   NEWS_NONE = 0,
-   NEWS_NEUTRAL,
-   NEWS_POSITIVE,
-   NEWS_NEGATIVE
-  };
-
-struct NewsItem
-  {
-   datetime       when;
-   ENUM_NEWS_SENT sent;
-   string         raw;
-  };
-
 int      g_atrHandle = INVALID_HANDLE;
+int      g_adxHandle = INVALID_HANDLE;
+int      g_h1EmaHandle = INVALID_HANDLE;
 datetime g_barTime = 0;
 CTrade   g_trade;
 
@@ -108,22 +95,11 @@ ulong    g_tickets[];
 int      g_held[];
 int      g_holdCap[];
 
-int      g_maxPos = 4;
+int      g_maxPos = 1;
 int      g_cooldown = 0;
 bool     g_openedBar = false;
 string   g_lastKind = "-";
 string   g_block = "";
-
-bool           g_newsReady = false;
-datetime       g_newsCutoff = 0;
-string         g_newsStatus = "OFF";
-string         g_newsErrOnce = "";
-bool           g_newsBadOnce = false;
-ENUM_NEWS_SENT g_newsLast = NEWS_NONE;
-bool           g_flipLot = false;
-ENUM_NEWS_SENT g_newsPend = NEWS_NONE;
-string         g_newsPendRaw = "";
-int            g_newsPendAge = 0;
 
 int      g_armState = 0; // 0 idle, 1 armed, 2 done this bar
 bool     g_armBuy = false;
@@ -131,6 +107,13 @@ double   g_armOpen = 0;
 double   g_armExtreme = 0;
 bool     g_velOk = false;
 bool     g_m1Warn = false;
+bool     g_adxWarn = false;
+bool     g_h1Warn = false;
+datetime g_wickSince = 0;
+datetime g_dayStamp = 0;
+double   g_dayStartEquity = 0;
+double   g_dayClosedPnl = 0;
+bool     g_dayHaltPrinted = false;
 
 //+------------------------------------------------------------------+
 ENUM_TIMEFRAMES TF()
@@ -216,11 +199,6 @@ int ClampHold()
    return MathMax(1, InpMaxBarsHold);
   }
 
-int ClampHoldNews()
-  {
-   return MathMax(1, InpMaxBarsHoldNews);
-  }
-
 double PullbackMin()
   {
    return MathMax(0.0, InpRapidPullbackMin);
@@ -230,205 +208,6 @@ double PullbackMax()
   {
    const double mn = PullbackMin();
    return (InpRapidPullbackMax < mn) ? mn : InpRapidPullbackMax;
-  }
-
-bool NewsNeedsRapid()
-  {
-   return (InpNewsRequireRapid && InpUseRapidBar && InpUseNewsSignal);
-  }
-
-ENUM_NEWS_SENT ParseSent(string s)
-  {
-   StringTrimLeft(s); StringTrimRight(s); StringToLower(s);
-   if(s == "positive") return NEWS_POSITIVE;
-   if(s == "negative") return NEWS_NEGATIVE;
-   if(s == "neutral")  return NEWS_NEUTRAL;
-   return NEWS_NONE;
-  }
-
-string SentText(const ENUM_NEWS_SENT s)
-  {
-   if(s == NEWS_POSITIVE) return "positive";
-   if(s == NEWS_NEGATIVE) return "negative";
-   if(s == NEWS_NEUTRAL)  return "neutral";
-   return "none";
-  }
-
-string FmtNewsDate(const datetime t)
-  {
-   MqlDateTime d;
-   TimeToStruct(t, d);
-   return StringFormat("%02d-%02d-%04d %02d:%02d:%02d",
-                       d.day, d.mon, d.year, d.hour, d.min, d.sec);
-  }
-
-bool ParseNewsDate(string raw, datetime &out)
-  {
-   out = 0;
-   StringTrimLeft(raw); StringTrimRight(raw);
-   string p[], dp[], tp[];
-   if(StringSplit(raw, ' ', p) < 2) return false;
-   if(StringSplit(p[0], '-', dp) != 3) return false;
-   if(StringSplit(p[1], ':', tp) < 2) return false;
-   MqlDateTime d;
-   ZeroMemory(d);
-   d.day  = (int)StringToInteger(dp[0]);
-   d.mon  = (int)StringToInteger(dp[1]);
-   d.year = (int)StringToInteger(dp[2]);
-   d.hour = (int)StringToInteger(tp[0]);
-   d.min  = (int)StringToInteger(tp[1]);
-   d.sec  = (ArraySize(tp) >= 3) ? (int)StringToInteger(tp[2]) : 0;
-   if(d.year < 1970 || d.mon < 1 || d.mon > 12 || d.day < 1) return false;
-   out = StructToTime(d);
-   return (out > 0);
-  }
-
-string UrlEnc(string s)
-  {
-   StringReplace(s, " ", "%20");
-   return s;
-  }
-
-string NewsUrl(const int page)
-  {
-   string url = InpNewsApiUrl;
-   const string q = "page=" + IntegerToString(MathMax(page, 1))
-                    + "&from=" + UrlEnc(FmtNewsDate(InpNewsBackfillFrom));
-   return url + ((StringFind(url, "?") >= 0) ? "&" : "?") + q;
-  }
-
-int JsonArrayStart(const string json)
-  {
-   int key = StringFind(json, "\"data\"");
-   if(key < 0) key = StringFind(json, "\"news\"");
-   int s = (key >= 0) ? StringFind(json, "[", key) : -1;
-   if(s < 0) s = StringFind(json, "[");
-   return s;
-  }
-
-bool JsonField(const string obj, const string key, string &out)
-  {
-   out = "";
-   const int k = StringFind(obj, "\"" + key + "\"");
-   if(k < 0) return false;
-   const int colon = StringFind(obj, ":", k);
-   if(colon < 0) return false;
-   const int n = StringLen(obj);
-   int i = colon + 1;
-   while(i < n)
-     {
-      const ushort c = (ushort)StringGetCharacter(obj, i);
-      if(c == ' ' || c == '\t' || c == '\r' || c == '\n') { i++; continue; }
-      if(c != '"') return false;
-      i++;
-      string cur = "";
-      bool esc = false;
-      for(; i < n; i++)
-        {
-         const ushort ch = (ushort)StringGetCharacter(obj, i);
-         if(esc) { cur += ShortToString(ch); esc = false; continue; }
-         if(ch == '\\') { esc = true; continue; }
-         if(ch == '"') { out = cur; return true; }
-         cur += ShortToString(ch);
-        }
-      return false;
-     }
-   return false;
-  }
-
-void JsonObjects(const string json, const int from, string &objs[])
-  {
-   ArrayResize(objs, 0);
-   int depth = 0, start = -1;
-   bool inStr = false, esc = false;
-   const int n = StringLen(json);
-   for(int i = from; i < n; i++)
-     {
-      const ushort c = (ushort)StringGetCharacter(json, i);
-      if(esc) { esc = false; continue; }
-      if(c == '\\' && inStr) { esc = true; continue; }
-      if(c == '"') { inStr = !inStr; continue; }
-      if(inStr) continue;
-      if(c == '{') { if(depth == 0) start = i; depth++; }
-      else if(c == '}')
-        {
-         depth--;
-         if(depth == 0 && start >= 0)
-           {
-            const int k = ArraySize(objs);
-            ArrayResize(objs, k + 1);
-            objs[k] = StringSubstr(json, start, i - start + 1);
-            start = -1;
-           }
-        }
-      else if(c == ']' && depth == 0)
-         break;
-     }
-  }
-
-void NewsBadOnce(const string d)
-  {
-   if(g_newsBadOnce) return;
-   g_newsBadOnce = true;
-   Print("News: zly rekord (raz): ", d);
-  }
-
-int ParseNewsJson(const string json, NewsItem &out[])
-  {
-   ArrayResize(out, 0);
-   const int start = JsonArrayStart(json);
-   if(start < 0) return -1;
-   string objs[];
-   JsonObjects(json, start, objs);
-   for(int i = 0; i < ArraySize(objs); i++)
-     {
-      string ds, ss;
-      if(!JsonField(objs[i], "date", ds) || !JsonField(objs[i], "signal", ss))
-        { NewsBadOnce("brak date/signal"); continue; }
-      datetime when = 0;
-      if(!ParseNewsDate(ds, when))
-        { NewsBadOnce("data " + ds); continue; }
-      const ENUM_NEWS_SENT sent = ParseSent(ss);
-      if(sent == NEWS_NONE)
-        { NewsBadOnce("signal " + ss); continue; }
-      const int k = ArraySize(out);
-      ArrayResize(out, k + 1);
-      out[k].when = when;
-      out[k].sent = sent;
-      out[k].raw  = ss;
-     }
-   return ArraySize(out);
-  }
-
-void SortNews(NewsItem &a[])
-  {
-   for(int i = 1; i < ArraySize(a); i++)
-     {
-      NewsItem key = a[i];
-      int j = i - 1;
-      while(j >= 0 && a[j].when > key.when) { a[j + 1] = a[j]; j--; }
-      a[j + 1] = key;
-     }
-  }
-
-bool NewsHas(const NewsItem &a[], const NewsItem &x)
-  {
-   for(int i = 0; i < ArraySize(a); i++)
-      if(a[i].when == x.when && a[i].sent == x.sent) return true;
-   return false;
-  }
-
-void NewsPush(NewsItem &dst[], const NewsItem &x)
-  {
-   if(NewsHas(dst, x)) return;
-   const int k = ArraySize(dst);
-   ArrayResize(dst, k + 1);
-   dst[k] = x;
-  }
-
-void NewsPushAll(NewsItem &dst[], const NewsItem &src[])
-  {
-   for(int i = 0; i < ArraySize(src); i++) NewsPush(dst, src[i]);
   }
 
 bool Ours(const ulong ticket)
@@ -444,6 +223,101 @@ int CountOurs()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
       if(Ours(PositionGetTicket(i))) c++;
    return c;
+  }
+
+datetime DayStart(const datetime t)
+  {
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   dt.hour = 0;
+   dt.min  = 0;
+   dt.sec  = 0;
+   return StructToTime(dt);
+  }
+
+double SumOurDealsSince(const datetime from)
+  {
+   double s = 0;
+   if(from <= 0 || !HistorySelect(from, TimeCurrent() + 1)) return 0;
+   const int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+     {
+      const ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic) continue;
+      s += HistoryDealGetDouble(ticket, DEAL_PROFIT)
+         + HistoryDealGetDouble(ticket, DEAL_SWAP)
+         + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+     }
+   return s;
+  }
+
+double FloatingOurs()
+  {
+   double s = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      const ulong t = PositionGetTicket(i);
+      if(!Ours(t)) continue;
+      s += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+     }
+   return s;
+  }
+
+void DayReset()
+  {
+   g_dayStamp = DayStart(TimeCurrent());
+   g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY) - FloatingOurs();
+   g_dayClosedPnl = SumOurDealsSince(g_dayStamp);
+   g_dayHaltPrinted = false;
+  }
+
+void EnsureDay()
+  {
+   const datetime d = DayStart(TimeCurrent());
+   if(d != g_dayStamp)
+      DayReset();
+  }
+
+void RefreshDayClosedPnl()
+  {
+   EnsureDay();
+   g_dayClosedPnl = SumOurDealsSince(g_dayStamp);
+  }
+
+double DayPnl()
+  {
+   EnsureDay();
+   return g_dayClosedPnl + FloatingOurs();
+  }
+
+double DayLossPct()
+  {
+   EnsureDay();
+   if(g_dayStartEquity <= 0.0) return 0;
+   const double pnl = DayPnl();
+   if(pnl >= 0.0) return 0;
+   return (-pnl / g_dayStartEquity) * 100.0;
+  }
+
+bool DailyLossOk()
+  {
+   if(InpMaxDailyLossPct <= 0.0) return true;
+   const double lossPct = DayLossPct();
+   if(lossPct >= InpMaxDailyLossPct)
+     {
+      g_block = "daily loss " + DoubleToString(lossPct, 2) + "%";
+      if(!g_dayHaltPrinted)
+        {
+         Print("Daily loss halt ", DoubleToString(lossPct, 2),
+               "% >= ", DoubleToString(InpMaxDailyLossPct, 2),
+               "% (this EA, server day)");
+         g_dayHaltPrinted = true;
+        }
+      return false;
+     }
+   return true;
   }
 
 int HoldIndex(const ulong ticket)
@@ -472,12 +346,6 @@ void HoldDrop(const ulong ticket)
   {
    const int i = HoldIndex(ticket);
    if(i >= 0) HoldRemove(i);
-  }
-
-int HoldCapFromComment(const string c)
-  {
-   if(StringFind(c, "NEWS") >= 0) return ClampHoldNews();
-   return ClampHold();
   }
 
 void HoldAdd(const ulong ticket, const int bars, const int cap)
@@ -509,7 +377,7 @@ void HoldRebuild()
       if(!Ours(t)) continue;
       const datetime ot = (datetime)PositionGetInteger(POSITION_TIME);
       const int sh = (ot > 0) ? iBarShift(_Symbol, TF(), ot, false) : 0;
-      HoldAdd(t, (sh < 0) ? 0 : sh, HoldCapFromComment(PositionGetString(POSITION_COMMENT)));
+      HoldAdd(t, (sh < 0) ? 0 : sh, ClampHold());
      }
   }
 
@@ -523,17 +391,6 @@ void CloseTicket(const ulong ticket, const string why)
      {
       Print("Close ", why, " #", ticket, " ", EnumToString(ty));
       HoldDrop(ticket);
-     }
-  }
-
-void CloseType(const ENUM_POSITION_TYPE ty, const string why)
-  {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      const ulong t = PositionGetTicket(i);
-      if(!Ours(t)) continue;
-      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != ty) continue;
-      CloseTicket(t, why);
      }
   }
 
@@ -556,6 +413,7 @@ void ResetBarState()
    g_armOpen = 0;
    g_armExtreme = 0;
    g_velOk = (InpRapidVelocitySec <= 0);
+   g_wickSince = 0;
   }
 
 bool NewBar()
@@ -574,6 +432,122 @@ bool CopyAtr(double &atr)
    if(CopyBuffer(g_atrHandle, 0, 1, 1, b) < 1) return false;
    atr = b[0];
    return (atr > 0.0);
+  }
+
+bool CopyClosedBuf(const int handle, const int buffer, const int count, double &dest[])
+  {
+   if(handle == INVALID_HANDLE || count < 1) return false;
+   // CopyBuffer can drop AS_SERIES. Re-apply after copy: dest[0]=shift 1 (last closed).
+   if(CopyBuffer(handle, buffer, 1, count, dest) < count) return false;
+   ArraySetAsSeries(dest, true);
+   return true;
+  }
+
+bool AtrRegimeOk()
+  {
+   if(!InpUseAtrRegime || InpMinAtrRatio <= 0.0) return true;
+   double cur = 0;
+   if(!CopyAtr(cur)) return true;
+   const int n = MathMax(10, InpAtrAvgBars);
+   double b[];
+   if(!CopyClosedBuf(g_atrHandle, 0, n, b)) return true;
+   double s = 0;
+   for(int i = 0; i < n; i++) s += b[i];
+   const double avg = s / n;
+   if(avg <= 0.0) return true;
+   if(cur / avg < InpMinAtrRatio)
+     {
+      g_block = "ATR compressed";
+      return false;
+     }
+   return true;
+  }
+
+bool AdxChopOk()
+  {
+   if(!InpUseAdxFilter) return true;
+   if(g_adxHandle == INVALID_HANDLE)
+     {
+      if(!g_adxWarn)
+        {
+         Print("Rapid: brak ADX — puszczam bez filtra chop");
+         g_adxWarn = true;
+        }
+      return true;
+     }
+   g_adxWarn = false;
+   double adx[];
+   if(!CopyClosedBuf(g_adxHandle, 0, 2, adx)) return true;
+   if(adx[0] < InpAdxMin)
+     {
+      g_block = "ADX chop";
+      return false;
+     }
+   if(InpAdxMustRise && adx[0] <= adx[1])
+     {
+      g_block = "ADX not rising";
+      return false;
+     }
+   return true;
+  }
+
+bool AdxDiOk(const bool buy)
+  {
+   if(!InpUseAdxFilter || !InpAdxUseDi) return true;
+   if(g_adxHandle == INVALID_HANDLE) return true;
+   double pdi[], ndi[];
+   if(!CopyClosedBuf(g_adxHandle, 1, 1, pdi)) return true;
+   if(!CopyClosedBuf(g_adxHandle, 2, 1, ndi)) return true;
+   if(buy && pdi[0] <= ndi[0])
+     {
+      g_block = "ADX DI against";
+      return false;
+     }
+   if(!buy && ndi[0] <= pdi[0])
+     {
+      g_block = "ADX DI against";
+      return false;
+     }
+   return true;
+  }
+
+bool H1EmaOk(const bool buy)
+  {
+   if(!InpUseH1Ema) return true;
+   if(g_h1EmaHandle == INVALID_HANDLE || Bars(_Symbol, PERIOD_H1) < 10)
+     {
+      if(!g_h1Warn)
+        {
+         Print("Rapid: brak H1 EMA — puszczam bez HTF");
+         g_h1Warn = true;
+        }
+      return true;
+     }
+   g_h1Warn = false;
+   double ema[];
+   if(!CopyClosedBuf(g_h1EmaHandle, 0, 1, ema)) return true;
+   const double cl = iClose(_Symbol, PERIOD_H1, 1);
+   if(cl <= 0.0 || ema[0] <= 0.0) return true;
+   if(buy && cl < ema[0])
+     {
+      g_block = "H1 EMA against";
+      return false;
+     }
+   if(!buy && cl > ema[0])
+     {
+      g_block = "H1 EMA against";
+      return false;
+     }
+   return true;
+  }
+
+bool RegimeOk(const bool buy)
+  {
+   if(!AtrRegimeOk()) return false;
+   if(!AdxChopOk()) return false;
+   if(!AdxDiOk(buy)) return false;
+   if(!H1EmaOk(buy)) return false;
+   return true;
   }
 
 double TickRound(const double p)
@@ -620,13 +594,25 @@ double TpDistance()
 
 bool SpreadOk()
   {
-   if(InpSpreadMaxPctSl <= 0.0) return true;
-   const double sl = SlDistance();
-   if(sl <= 0.0) return false;
-   if(SpreadPx() > sl * InpSpreadMaxPctSl)
+   const double spr = SpreadPx();
+   if(InpSpreadMaxPctSl > 0.0)
      {
-      g_block = "spread";
-      return false;
+      const double sl = SlDistance();
+      if(sl <= 0.0) return false;
+      if(spr > sl * InpSpreadMaxPctSl)
+        {
+         g_block = "spread";
+         return false;
+        }
+     }
+   if(InpMinTpSpreadMult > 0.0)
+     {
+      const double tp = TpDistance();
+      if(spr > 0.0 && tp < spr * InpMinTpSpreadMult)
+        {
+         g_block = "TP vs spread";
+         return false;
+        }
      }
    return true;
   }
@@ -637,10 +623,13 @@ bool CanOpen()
      { g_block = "AutoTrading OFF"; return false; }
    if(InpUseSessionFilter && !IsInTradingSession())
      { g_block = "outside session (" + SessionStatusText() + ")"; return false; }
+   if(!DailyLossOk()) return false;
    if(g_openedBar) { g_block = "juz otwarto na barze"; return false; }
    if(g_cooldown > 0) { g_block = "cooldown"; return false; }
    if(CountOurs() >= g_maxPos) { g_block = "max pozycji"; return false; }
    if(!SpreadOk()) return false;
+   if(!AtrRegimeOk()) return false;
+   if(!AdxChopOk()) return false;
    return true;
   }
 
@@ -657,9 +646,7 @@ double NormVol(double lots)
 
 double NextLots()
   {
-   double l = InpLots;
-   if(g_flipLot && InpNewsFlipLotMult > 1.0) l *= InpNewsFlipLotMult;
-   return NormVol(l);
+   return NormVol(InpLots);
   }
 
 void CalcSLTP(const bool buy, double &sl, double &tp)
@@ -762,17 +749,10 @@ void OpenDir(const bool buy, const string tag)
    g_openedBar = true;
    g_armState  = 2;
    g_cooldown  = MathMax(InpCooldownBars, 0);
-   g_flipLot   = false;
    g_lastKind  = tag;
-   if(StringFind(tag, "NEWS") >= 0)
-     {
-      g_newsPend = NEWS_NONE;
-      g_newsPendRaw = "";
-      g_newsPendAge = 0;
-     }
    const ulong ticket = Newest(buy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
    if(ticket == 0) return;
-   HoldAdd(ticket, 0, HoldCapFromComment(tag));
+   HoldAdd(ticket, 0, ClampHold());
    AttachStops(ticket, buy);
    Print("Signal ", tag, " #", ticket);
   }
@@ -815,17 +795,24 @@ bool M1Confirm(const bool buy)
       return true;
      }
    g_m1Warn = false;
-   const int last = MathMax(0, InpRapidM1Bars);
-   for(int i = 0; i <= last; i++)
+   const int need = MathMax(1, InpRapidM1Bars);
+   for(int i = 1; i <= need; i++)
      {
       const double op = iOpen(_Symbol, PERIOD_M1, i);
       const double cl = iClose(_Symbol, PERIOD_M1, i);
       if(op <= 0.0 || cl <= 0.0) continue;
-      if(buy && cl > op) return true;
-      if(!buy && cl < op) return true;
+      if(buy && cl <= op)
+        {
+         g_block = "M1 przeciwne";
+         return false;
+        }
+      if(!buy && cl >= op)
+        {
+         g_block = "M1 przeciwne";
+         return false;
+        }
      }
-   g_block = "M1 przeciwne";
-   return false;
+   return true;
   }
 
 bool RapidQualify(bool &buy, const bool strict)
@@ -886,12 +873,13 @@ bool RapidQualify(bool &buy, const bool strict)
       return false;
      }
    if(!M1Confirm(buy)) return false;
+   if(!RegimeOk(buy)) return false;
    return true;
   }
 
 bool RangeExhausted()
   {
-   if(InpRapidAtrMax <= 0.0) return false;
+   if(InpRapidAtrMax <= 0.0 || InpRapidAtrMax < InpRapidAtrMult) return false;
    double atr = 0;
    if(!CopyAtr(atr)) return false;
    const double rng = iHigh(_Symbol, TF(), 0) - iLow(_Symbol, TF(), 0);
@@ -945,21 +933,13 @@ void TryPullback()
       return;
      }
    if(frac < PullbackMin()) return;
-   OpenDir(g_armBuy, g_armBuy ? "RAPID BUY" : "RAPID SELL");
-  }
-
-void TryNewsConfirm()
-  {
-   if(g_newsPend != NEWS_POSITIVE && g_newsPend != NEWS_NEGATIVE) return;
-   bool buy = false;
-   if(!RapidQualify(buy, false)) return;
-   const bool wantBuy = (g_newsPend == NEWS_POSITIVE);
-   if(buy != wantBuy)
+   if(!RegimeOk(g_armBuy))
      {
-      g_block = "news vs rapid mismatch";
+      if(StringFind(g_block, "H1") >= 0 || StringFind(g_block, "DI") >= 0)
+         g_armState = 2;
       return;
      }
-   OpenDir(wantBuy, wantBuy ? "NEWS+RAPID BUY" : "NEWS+RAPID SELL");
+   OpenDir(g_armBuy, g_armBuy ? "RAPID BUY" : "RAPID SELL");
   }
 
 void TryRapid()
@@ -974,177 +954,16 @@ void TryRapid()
      }
 
    bool buy = false;
-   if(!RapidQualify(buy, false)) return;
-   if(g_newsPend == NEWS_POSITIVE && !buy)
-     { g_block = "rapid vs pending news"; return; }
-   if(g_newsPend == NEWS_NEGATIVE && buy)
-     { g_block = "rapid vs pending news"; return; }
-
-   string tag = buy ? "RAPID BUY" : "RAPID SELL";
-   if(g_newsPend == NEWS_POSITIVE || g_newsPend == NEWS_NEGATIVE)
-      tag = buy ? "NEWS+RAPID BUY" : "NEWS+RAPID SELL";
-   OpenDir(buy, tag);
-  }
-
-void ApplyNewsLive(const ENUM_NEWS_SENT sent, const string raw)
-  {
-   if(sent != NEWS_POSITIVE && sent != NEWS_NEGATIVE) return;
-   const bool flip = (g_newsLast != NEWS_NONE && g_newsLast != sent);
-   g_newsLast = sent;
-   if(flip)
+   if(!RapidQualify(buy, true)) return;
+   if(RangeExhausted())
      {
-      g_flipLot = true;
-      CloseType(sent == NEWS_POSITIVE ? POSITION_TYPE_SELL : POSITION_TYPE_BUY, "news flip");
-      g_newsStatus = raw + " | FLIP";
-      Print("News FLIP ", raw);
-     }
-   else
-     {
-      g_newsStatus = raw;
-      Print("News ", raw);
-     }
-
-   if(NewsNeedsRapid())
-     {
-      g_newsPend = sent;
-      g_newsPendRaw = raw;
-      g_newsPendAge = 0;
-      g_newsStatus = raw + " | wait Rapid";
-      TryNewsConfirm();
+      g_block = "too extended";
       return;
      }
-   OpenDir(sent == NEWS_POSITIVE, sent == NEWS_POSITIVE ? "NEWS BUY" : "NEWS SELL");
-  }
-
-void ProcessNews(NewsItem &items[], const bool live)
-  {
-   SortNews(items);
-   datetime maxSeen = g_newsCutoff;
-   int n = 0;
-   for(int i = 0; i < ArraySize(items); i++)
-     {
-      if(items[i].when < InpNewsBackfillFrom) continue;
-      if(live && items[i].when <= g_newsCutoff) continue;
-      if(items[i].sent == NEWS_POSITIVE || items[i].sent == NEWS_NEGATIVE)
-        {
-         if(live) ApplyNewsLive(items[i].sent, items[i].raw);
-         else     g_newsLast = items[i].sent;
-        }
-      if(items[i].when > maxSeen) maxSeen = items[i].when;
-      n++;
-     }
-   if(maxSeen > g_newsCutoff) g_newsCutoff = maxSeen;
-   if(!live)
-     {
-      if(n <= 0 && g_newsCutoff <= 0) g_newsCutoff = TimeCurrent();
-      g_newsReady  = true;
-      g_newsStatus = SentText(g_newsLast) + " | memory";
-      Print("News backfill n=", n, " last=", SentText(g_newsLast));
-     }
-  }
-
-bool NewsGet(const int page, string &body)
-  {
-   body = "";
-   if(InpNewsApiUrl == "")
-     { g_newsStatus = "brak URL"; return false; }
-   string hdr = "";
-   if(InpNewsApiToken != "")
-      hdr = "Authorization: Bearer " + InpNewsApiToken + "\r\n";
-   char data[], res[];
-   string rh;
-   ArrayResize(data, 0);
-   ResetLastError();
-   const int http = WebRequest("GET", NewsUrl(page), hdr, NEWS_HTTP_TIMEOUT_MS, data, res, rh);
-   if(http == -1)
-     {
-      const int e = GetLastError();
-      g_newsStatus = (e == 4060) ? "4060 Allow WebRequest" : ("err " + IntegerToString(e));
-      if(g_newsErrOnce != IntegerToString(e))
-        { Print("News WebRequest ", e); g_newsErrOnce = IntegerToString(e); }
-      return false;
-     }
-   if(http != 200)
-     {
-      g_newsStatus = "HTTP " + IntegerToString(http);
-      if(g_newsErrOnce != g_newsStatus)
-        { Print("News ", g_newsStatus); g_newsErrOnce = g_newsStatus; }
-      return false;
-     }
-   g_newsErrOnce = "";
-   body = CharArrayToString(res, 0, WHOLE_ARRAY, CP_UTF8);
-   return true;
-  }
-
-bool NewsPage(const string body, NewsItem &items[])
-  {
-   ArrayResize(items, 0);
-   if(ParseNewsJson(body, items) < 0)
-     {
-      g_newsStatus = "zly JSON";
-      if(g_newsErrOnce != "json")
-        { Print("News JSON: ", StringSubstr(body, 0, 80)); g_newsErrOnce = "json"; }
-      return false;
-     }
-   return true;
-  }
-
-void NewsBackfill()
-  {
-   NewsItem all[];
-   ArrayResize(all, 0);
-   g_newsStatus = "backfill";
-   for(int page = 1; page <= NEWS_MAX_PAGES; page++)
-     {
-      string body;
-      if(!NewsGet(page, body)) return;
-      NewsItem pg[];
-      if(!NewsPage(body, pg)) return;
-      if(ArraySize(pg) <= 0) { Print("News pusta strona ", page); break; }
-      for(int i = 0; i < ArraySize(pg); i++)
-         if(pg[i].when >= InpNewsBackfillFrom) NewsPush(all, pg[i]);
-     }
-   ProcessNews(all, false);
-  }
-
-void NewsLive()
-  {
-   NewsItem all[];
-   ArrayResize(all, 0);
-   bool seenOld = false;
-   for(int page = 1; page <= NEWS_MAX_PAGES && !seenOld; page++)
-     {
-      string body;
-      if(!NewsGet(page, body)) return;
-      NewsItem pg[];
-      if(!NewsPage(body, pg)) return;
-      if(ArraySize(pg) <= 0) { if(page == 1) return; break; }
-      NewsPushAll(all, pg);
-      for(int i = 0; i < ArraySize(pg); i++)
-         if(pg[i].when <= g_newsCutoff) { seenOld = true; break; }
-     }
-   ProcessNews(all, true);
-  }
-
-void NewsPoll()
-  {
-   if(!InpUseNewsSignal) return;
-   if(!g_newsReady) NewsBackfill();
-   else NewsLive();
-  }
-
-void AgeNewsPend()
-  {
-   if(g_newsPend != NEWS_POSITIVE && g_newsPend != NEWS_NEGATIVE) return;
-   g_newsPendAge++;
-   if(g_newsPendAge >= MathMax(1, InpNewsConfirmBars))
-     {
-      Print("News timeout, brak Rapid: ", g_newsPendRaw);
-      g_newsStatus = g_newsPendRaw + " | timeout Rapid";
-      g_newsPend = NEWS_NONE;
-      g_newsPendRaw = "";
-      g_newsPendAge = 0;
-     }
+   if(PullbackMin() <= 0.0)
+      OpenDir(buy, buy ? "RAPID BUY" : "RAPID SELL");
+   else
+      ArmImpulse(buy);
   }
 
 void AbortRapidWick()
@@ -1156,20 +975,49 @@ void AbortRapidWick()
    const double lo = iLow(_Symbol, TF(), 0);
    if(hi <= lo || op <= 0.0) return;
    const double body = MathAbs(cl - op) / (hi - lo);
-   if(body >= InpRapidAbortBody) return;
+   if(body >= InpRapidAbortBody)
+     {
+      g_wickSince = 0;
+      return;
+     }
+
+   bool hit = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      const ulong t = PositionGetTicket(i);
+      if(!Ours(t)) continue;
+      const string c = PositionGetString(POSITION_COMMENT);
+      if(StringFind(c, "RAPID") < 0) continue;
+      const datetime ot = (datetime)PositionGetInteger(POSITION_TIME);
+      if(iBarShift(_Symbol, TF(), ot, false) != 0) continue;
+      const bool buy = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      if(buy && cl < op) hit = true;
+      if(!buy && cl > op) hit = true;
+     }
+   if(!hit)
+     {
+      g_wickSince = 0;
+      return;
+     }
+   if(InpRapidAbortSec > 0)
+     {
+      if(g_wickSince <= 0) g_wickSince = TimeCurrent();
+      if((TimeCurrent() - g_wickSince) < InpRapidAbortSec) return;
+     }
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       const ulong t = PositionGetTicket(i);
       if(!Ours(t)) continue;
       const string c = PositionGetString(POSITION_COMMENT);
-      if(StringFind(c, "RAPID") < 0 || StringFind(c, "NEWS") >= 0) continue;
+      if(StringFind(c, "RAPID") < 0) continue;
       const datetime ot = (datetime)PositionGetInteger(POSITION_TIME);
       if(iBarShift(_Symbol, TF(), ot, false) != 0) continue;
       const bool buy = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-      if(buy && cl < op) CloseTicket(t, "Rapid wick");
-      if(!buy && cl > op) CloseTicket(t, "Rapid wick");
+      if((buy && cl < op) || (!buy && cl > op))
+         CloseTicket(t, "Rapid wick");
      }
+   g_wickSince = 0;
   }
 
 void ManageStops()
@@ -1192,26 +1040,29 @@ void ManageStops()
       const double px = buy ? bid : ask;
       if(entry <= 0.0 || px <= 0.0) continue;
       const double profit = buy ? (bid - entry) : (entry - ask);
+      const double spread = SpreadPx();
       double newSL = curSL;
+      const double be = buy ? TickRound(entry + md) : TickRound(entry - md);
 
-      if(haveAtr && InpBeAtrMult > 0.0 && profit >= atr * InpBeAtrMult)
+      if(haveAtr && InpBeAtrMult > 0.0 && profit >= atr * InpBeAtrMult && profit > spread)
         {
-         const double be = buy ? TickRound(entry + md) : TickRound(entry - md);
          if(BetterSL(buy, be, newSL)) newSL = be;
         }
-      if(haveAtr && InpTrailAtrMult > 0.0 && profit > 0.0)
+      if(haveAtr && InpTrailAtrMult > 0.0 && profit > spread)
         {
          const double tr = buy ? TickRound(bid - atr * InpTrailAtrMult)
                                : TickRound(ask + atr * InpTrailAtrMult);
-         if(BetterSL(buy, tr, newSL)) newSL = tr;
+         const bool atOrBeyondBe = buy ? (tr >= be) : (tr <= be);
+         if(atOrBeyondBe && BetterSL(buy, tr, newSL)) newSL = tr;
         }
-      if(InpTrailM1 && profit > 0.0)
+      if(InpTrailM1 && profit > spread)
         {
          const double m1 = buy ? iLow(_Symbol, PERIOD_M1, 1) : iHigh(_Symbol, PERIOD_M1, 1);
          if(m1 > 0.0)
            {
             const double tr = buy ? TickRound(m1 - md) : TickRound(m1 + md);
-            if(BetterSL(buy, tr, newSL)) newSL = tr;
+            const bool atOrBeyondBe = buy ? (tr >= be) : (tr <= be);
+            if(atOrBeyondBe && BetterSL(buy, tr, newSL)) newSL = tr;
            }
         }
 
@@ -1241,41 +1092,70 @@ void Draw()
    string arm = "idle";
    if(g_armState == 1) arm = g_armBuy ? "ARM BUY" : "ARM SELL";
    else if(g_armState == 2) arm = "done";
-   string pend = "";
-   if(g_newsPend == NEWS_POSITIVE || g_newsPend == NEWS_NEGATIVE)
-      pend = " pend=" + SentText(g_newsPend) + "/" + IntegerToString(g_newsPendAge);
+   string regime = "";
+   if(InpUseAdxFilter)
+     {
+      double adx[];
+      if(CopyClosedBuf(g_adxHandle, 0, 1, adx))
+         regime += "  ADX=" + DoubleToString(adx[0], 1);
+      else
+         regime += "  ADX=?";
+     }
+   if(InpUseH1Ema)
+     {
+      double ema[];
+      const double h1c = iClose(_Symbol, PERIOD_H1, 1);
+      if(CopyClosedBuf(g_h1EmaHandle, 0, 1, ema) && h1c > 0.0 && ema[0] > 0.0)
+         regime += (h1c > ema[0] ? "  H1+" : (h1c < ema[0] ? "  H1-" : "  H1="));
+      else
+         regime += "  H1=?";
+     }
    Comment(
-      "Event_Scalp v2.11  ", EnumToString(TF()), "\n",
+      "Event_Scalp v2.27  ", EnumToString(TF()), "\n",
       "Session: ", (InpUseSessionFilter ? ("ON " + SessionStatusText()
                    + (IsInTradingSession() ? " OPEN" : " CLOSED")) : "OFF"), "\n",
-      "News: ", InpUseNewsSignal ? g_newsStatus : "OFF", pend, "\n",
       "Rapid: ", InpUseRapidBar ? "ON" : "OFF",
       "  ", arm,
       "  vel=", (g_velOk ? "OK" : "wait"),
-      "  ATR=", DoubleToString(atr, _Digits), "\n",
+      "  ATR=", DoubleToString(atr, _Digits),
+      regime, "\n",
       "disp=", DoubleToString(pt > 0 ? disp / pt : 0, 0),
       "  rng=", DoubleToString(pt > 0 ? rng / pt : 0, 0), " pkt",
       "  min=", DoubleToString((pt > 0 && atr > 0) ? atr * InpRapidAtrMult / pt : 0, 0),
       "  body=", DoubleToString((rng > 0) ? 100.0 * disp / rng : 0, 0), "%\n",
       g_lastKind, (g_block != "" ? (" | " + g_block) : ""), "\n",
       "Pos ", CountOurs(), "/", g_maxPos,
-      "  hold R/N ", ClampHold(), "/", ClampHoldNews(),
+      "  hold ", ClampHold(),
       "  CD ", g_cooldown,
-      "  spr ", DoubleToString(pt > 0 ? SpreadPx() / pt : 0, 0)
+      "  spr ", DoubleToString(pt > 0 ? SpreadPx() / pt : 0, 0),
+      (InpMaxDailyLossPct > 0.0
+         ? ("  dd " + DoubleToString(DayLossPct(), 2) + "/" + DoubleToString(InpMaxDailyLossPct, 1) + "%")
+         : "  dd OFF")
    );
   }
 
 int OnInit()
   {
-   if(!InpUseNewsSignal && !InpUseRapidBar)
+   if(!InpUseRapidBar)
      {
-      Print("Wlacz News i/lub Rapid bar.");
+      Print("Wlacz Rapid bar.");
       return INIT_PARAMETERS_INCORRECT;
      }
    if(!IsValidHour(InpSession1StartHour) || !IsValidHour(InpSession1EndHour) ||
       !IsValidHour(InpSession2StartHour) || !IsValidHour(InpSession2EndHour))
      {
       Print("Session hours must be 0-23.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+
+   if(InpUseAdxFilter && InpAdxPeriod < 2)
+     {
+      Print("ADX period must be >= 2.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpUseH1Ema && InpH1EmaPeriod < 2)
+     {
+      Print("H1 EMA period must be >= 2.");
       return INIT_PARAMETERS_INCORRECT;
      }
 
@@ -1287,61 +1167,61 @@ int OnInit()
       return INIT_FAILED;
      }
 
+   g_adxHandle = INVALID_HANDLE;
+   if(InpUseAdxFilter)
+     {
+      g_adxHandle = iADX(_Symbol, TF(), InpAdxPeriod);
+      if(g_adxHandle == INVALID_HANDLE)
+         Print("iADX fail ", GetLastError(), " — puszczam bez filtra chop");
+     }
+
+   g_h1EmaHandle = INVALID_HANDLE;
+   if(InpUseH1Ema)
+     {
+      g_h1EmaHandle = iMA(_Symbol, PERIOD_H1, InpH1EmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      if(g_h1EmaHandle == INVALID_HANDLE)
+         Print("H1 iMA fail ", GetLastError(), " — puszczam bez HTF");
+     }
+
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(SLIPPAGE_POINTS);
    g_trade.SetTypeFillingBySymbol(_Symbol);
    HoldRebuild();
+   DayReset();
    ResetBarState();
    g_barTime = iTime(_Symbol, TF(), 0);
-
-   g_flipLot = false;
-   g_newsReady = false;
-   g_newsCutoff = 0;
-   g_newsLast = NEWS_NONE;
-   g_newsPend = NEWS_NONE;
-   g_newsPendRaw = "";
-   g_newsPendAge = 0;
-   g_newsStatus = InpUseNewsSignal ? "czekam" : "OFF";
    g_m1Warn = false;
+   g_adxWarn = false;
+   g_h1Warn = false;
 
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
       Print("UWAGA: AutoTrading OFF");
-   if(InpNewsRequireRapid && InpUseNewsSignal && !InpUseRapidBar)
-      Print("UWAGA: NewsRequireRapid ON, ale Rapid OFF — news wejdzie bez potwierdzenia");
 
-   Print("Event_Scalp 2.11 long-bar rng>=ATR*", DoubleToString(InpRapidAtrMult, 2),
-         " news=", InpUseNewsSignal, " rapid=", InpUseRapidBar,
-         " news&rapid=", NewsNeedsRapid(),
+   Print("Event_Scalp 2.27 M15 Rapid rng>=ATR*", DoubleToString(InpRapidAtrMult, 2),
          " SL/TP ATR ", InpUseAtrStops, " ", DoubleToString(InpSlAtrMult, 2), "/",
          DoubleToString(InpTpAtrMult, 2),
-         " | session=", (InpUseSessionFilter ? SessionStatusText() : "OFF"));
-   Print("Reset Inputow w MT5 (prawy klik na EA -> Reset) jesli widzisz stare Rapid 1.8/M1/pullback.");
+         " pullback=", DoubleToString(PullbackMin(), 2), "-", DoubleToString(PullbackMax(), 2),
+         " ADX=", (InpUseAdxFilter ? DoubleToString(InpAdxMin, 0) : "OFF"),
+         " H1EMA=", (InpUseH1Ema ? IntegerToString(InpH1EmaPeriod) : "OFF"),
+         " ATRratio=", (InpUseAtrRegime ? DoubleToString(InpMinAtrRatio, 2) : "OFF"),
+         " | session=", (InpUseSessionFilter ? SessionStatusText() : "OFF"),
+         " dailyLoss=", (InpMaxDailyLossPct > 0.0 ? (DoubleToString(InpMaxDailyLossPct, 1) + "%") : "OFF"));
+   Print("Reset Inputow w MT5 (prawy klik na EA -> Reset) jesli widzisz stare 2.26 bez daily loss.");
 
-   if(InpUseNewsSignal)
-     {
-      if(InpNewsApiUrl == "") Print("UWAGA: News ON, pusty URL");
-      else Print("Allow WebRequest: ", InpNewsApiUrl);
-      EventSetTimer(MathMax(InpNewsPollSeconds, 1));
-      NewsPoll();
-     }
    return INIT_SUCCEEDED;
   }
 
 void OnDeinit(const int reason)
   {
-   EventKillTimer();
    if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+   if(g_adxHandle != INVALID_HANDLE) IndicatorRelease(g_adxHandle);
+   if(g_h1EmaHandle != INVALID_HANDLE) IndicatorRelease(g_h1EmaHandle);
    Comment("");
-  }
-
-void OnTimer()
-  {
-   NewsPoll();
-   Draw();
   }
 
 void OnTick()
   {
+   EnsureDay();
    HoldPrune();
    if(NewBar())
      {
@@ -1349,13 +1229,11 @@ void OnTick()
       g_block = "";
       HoldExpire();
       if(g_cooldown > 0) g_cooldown--;
-      AgeNewsPend();
       ResetBarState();
      }
    UpdateVelocity();
    AbortRapidWick();
    ManageStops();
-   TryNewsConfirm();
    TryRapid();
    Draw();
   }
@@ -1370,8 +1248,10 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) return;
    if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagic) return;
    const long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+   const ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON);
+   RefreshDayClosedPnl();
    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT) return;
-   if((ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON) != DEAL_REASON_SL) return;
+   if(reason != DEAL_REASON_SL) return;
    if(InpCooldownAfterSL > 0)
       g_cooldown = MathMax(g_cooldown, InpCooldownAfterSL);
   }

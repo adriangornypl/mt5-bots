@@ -45,7 +45,7 @@ On FX, **triple-swap** is on by default: flatten about an hour before the 3-day 
 ## What this robot does not do
 
 - It does not scalp the candle that is still printing (that is Event_Scalp).
-- It does not fade RSI with no trend filter (that is MACD_RSI_Cross priority 1).
+- It does not fade RSI with no trend filter (that is MACD_RSI_Cross_Bull only when Trend follow is off).
 - It does not treat “400 points” as 400 Dow index points. On a US30 chart with 2 decimals, 400 points is 4.00 on the index.
 - It does not guarantee that an EMA uptrend continues after you pyramid.
 - It does not replace position sizing. Several 0.01 lots stacked is still more risk than one.

@@ -1,26 +1,30 @@
 //+------------------------------------------------------------------+
-//|                                              MACD_RSI_Cross.mq5  |
-//|  Prio 1 RSI: BUY while closed RSI < OS (not only the cross bar). |
-//|  One successful open per bar. If higher prio does not open,      |
-//|  lower prio may still fire (failed P1 no longer swallows EMA).   |
-//|  RSI 40/60 confirm applies ONLY to MACD, never to EMA.           |
+//|                                         MACD_RSI_Cross_Bull.mq5  |
+//|  v2.00 default: TREND FOLLOW. EMA vs SMA is direction + exit.    |
+//|  Prio 1 RSI: WITH-trend pullback (OS=BUY in up, OB=SELL in down).|
+//|  Prio 2: EMA/SMA cross starts the ride (does not fade).          |
+//|  Prio 3 MACD: only WITH the EMA/SMA side. RSI confirm=MACD only. |
+//|  Close on clear EMA/SMA flip (no ADX required to close).         |
+//|  Against-trend RSI/MACD do NOT flatten a trend position.         |
+//|  One successful open per bar. Failed higher prio does not swallow.|
 //|  NOTE: "bars" = candles on InpTimeframe (e.g. 30 on M15 = 7.5h). |
-//|  MaxBarsHold: HARD close after N signal-TF candles from open.    |
+//|  MaxBarsHold: 0=off (ride until flip). Else hard close after N.  |
 //|  Counted from POSITION_TIME (survives reattach / recompile).     |
-//|  SL/TP: points by default (recommended). Optional % of PRICE.    |
+//|  SL required. TP 0=none. Optional % of PRICE (not account).      |
 //|  Spread is added to SL/TP so Bid-chart distances match inputs.   |
 //|  After every open, POSITION_SL/TP are verified (+ PositionModify).|
 //|  ADX filter (optional): gates ALL priorities — trend strength +  |
 //|  optional +DI/-DI direction match before any BUY/SELL open.      |
-//|  Session hours: new entries only; SL/TP + MaxBarsHold still run. |
+//|  Session hours: new entries only; SL/TP/hold/flip still run.     |
+//|  Daily stop (% of balance, 0=off): halt NEW entries until the    |
+//|  next session window (session off = next session-clock day).     |
 //|  OneTradeOnly: true = 1 position. false = add SAME direction.    |
-//|  Opposite signal always flattens ALL our positions, then may open.|
-//|  TRIPLE SWAP (v1.90, FX e.g. EURUSD, default ON): close 1h before|
-//|  the 3-day swap rollover (usually Wed 23:00 server). Reopen next |
-//|  day if MaxBarsHold still has remaining bars.                    |
+//|  TrendFollow OFF restores v1.90 fade + opposite-signal flatten.  |
+//|  TRIPLE SWAP (FX, default ON): close 1h before 3-day rollover.   |
+//|  Reopen next day if hold + (when TrendFollow) EMA/SMA still valid.|
 //+------------------------------------------------------------------+
 #property copyright "My robots"
-#property version   "1.90"
+#property version   "2.04"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -36,24 +40,35 @@ enum ENUM_SESSION_CLOCK
    SESSION_CLOCK_LOCAL  = 2  // PC local time
   };
 
+enum ENUM_TREND_DIR
+  {
+   TREND_FLAT = 0,
+   TREND_UP   = 1,
+   TREND_DOWN = 2
+  };
+
 //==================== PRIORITY SWITCHES =============================
 input group "=== Priority switches ==="
-input bool               InpUsePrio1        = true;         // Prio 1: RSI Min/Max
-input bool               InpUsePrio2        = true;         // Prio 2: EMA9/SMA21 momentum
-input bool               InpUsePrio3        = true;         // Prio 3: MACD
+input bool               InpUsePrio1        = true;         // Prio 1: RSI pullback (with-trend when TrendFollow)
+input bool               InpUsePrio2        = true;         // Prio 2: EMA/SMA cross (starts the ride)
+input bool               InpUsePrio3        = true;         // Prio 3: MACD (with-trend when TrendFollow)
+
+//==================== TREND FOLLOW ==================================
+input group "=== Trend follow (mid-term) ==="
+input bool               InpTrendFollowMode = true;         // Only WITH EMA/SMA; close on flip (OFF=v1.90 fade)
 
 //==================== PRIO 1: RSI EXTREMES ==========================
-input group "=== Prio 1: RSI Extremes (no confirmation) ==="
+input group "=== Prio 1: RSI Extremes ==="
 input int                InpRsiPeriod       = 10;           // RSI Period (must match the chart)
 input ENUM_APPLIED_PRICE InpRsiApplied      = PRICE_CLOSE;  // RSI Applied price
-input double             InpRsiOversold     = 30.0;         // BUY when closed RSI is below this
-input double             InpRsiOverbought   = 70.0;         // SELL when closed RSI is above this
+input double             InpRsiOversold     = 30.0;         // TrendFollow: BUY dip in UP. OFF: fade BUY
+input double             InpRsiOverbought   = 70.0;         // TrendFollow: SELL rally in DOWN. OFF: fade SELL
 
-//==================== PRIO 2: MOMENTUM EMA/SMA ======================
-input group "=== Prio 2: Short-term momentum ==="
-input int                InpMomEmaPeriod    = 20;            // Fast EMA period
-input int                InpMomSmaPeriod    = 96;           // Slow SMA period
-input ENUM_APPLIED_PRICE InpMomApplied      = PRICE_CLOSE;  // Momentum applied price
+//==================== PRIO 2: EMA/SMA TREND =========================
+input group "=== Prio 2: EMA/SMA (trend + cross entry) ==="
+input int                InpMomEmaPeriod    = 21;            // Fast EMA period (trend when TrendFollow)
+input int                InpMomSmaPeriod    = 70;           // Slow SMA period (trend when TrendFollow)
+input ENUM_APPLIED_PRICE InpMomApplied      = PRICE_CLOSE;  // EMA/SMA applied price
 
 //==================== PRIO 3: MACD ==================================
 input group "=== Prio 3: MACD ==="
@@ -62,33 +77,34 @@ input int                InpMacdSlow        = 26;           // MACD Slow EMA
 input int                InpMacdSignal      = 9;            // MACD Signal SMA
 input ENUM_APPLIED_PRICE InpMacdApplied     = PRICE_CLOSE;  // MACD Applied price
 input bool               InpMacdRequireRsiConfirm = true;   // Require RSI confirmation for MACD
-input double             InpRsiBuyLevel     = 40.0;         // MACD BUY: RSI must cross above
-input double             InpRsiSellLevel    = 60.0;         // MACD SELL: RSI must cross below
+input double             InpRsiBuyLevel     = 36.0;         // MACD BUY: RSI must cross above
+input double             InpRsiSellLevel    = 70.0;         // MACD SELL: RSI must cross below
 input int                InpRsiConfirmBars  = 5;            // Max bars to wait for RSI after MACD
 
 //==================== ADX TREND FILTER (ALL PRIORITIES) ==============
 // Applies to Prio 1 + Prio 2 + Prio 3 when enabled — one gate before open.
 input group "=== ADX trend filter (ALL priorities) ==="
-input bool               InpUseAdxFilter      = false;       // Enable ADX filter for ALL priorities
+input bool               InpUseAdxFilter      = true;        // Enable ADX filter for ALL priorities
 input int                InpAdxPeriod         = 14;         // ADX period
 input double             InpAdxMinLevel       = 25.0;       // Require ADX >= this (trending); block if lower
 input bool               InpAdxUseDiDirection = true;       // Match DI: BUY if +DI>-DI, SELL if -DI>+DI
 
 //==================== TRADE SETTINGS ================================
 input group "=== Trade ==="
-input double             InpLots            = 0.50;         // Lot size
+input double             InpLots            = 0.10;         // Lot size
 input bool               InpUsePercentSLTP  = false;        // true=% of price | false=points (recommended)
-input int                InpStopLossPoints  = 500;          // SL distance in points (e.g. 500 = 50 pips on 5-digit FX)
-input int                InpTakeProfitPoints = 2000;        // TP distance in points (e.g. 1000 = 100 pips on 5-digit FX)
+input int                InpStopLossPoints  = 1000;          // SL distance in points (e.g. 400 = 40 pips on 5-digit FX)
+input int                InpTakeProfitPoints = 5000;        // TP in points (0=none; ride until trend flip / SL)
 input double             InpStopLossPercent = 1.0;          // WARNING: % of PRICE (not account!). Only if InpUsePercentSLTP=true
-input double             InpTakeProfitPercent = 1.0;        // WARNING: % of PRICE (not account!). Only if InpUsePercentSLTP=true
-input int                InpMaxBarsHold     = 10;           // Close EVERY position after N TF candles (hard limit)
+input double             InpTakeProfitPercent = 0.0;        // 0=none. WARNING: % of PRICE (not account!)
+input int                InpMaxBarsHold     = 120;           // Hard close after N TF candles (0=off; ride until flip)
 input bool               InpIncludeSpread   = true;         // Add current spread to SL and TP distances
 input int                InpSlippage        = 30;           // Max slippage (points)
 input ulong              InpMagic           = 18300621;     // Magic number
 input bool               InpOneTradeOnly    = true;         // true=1 position; false=add in the SAME direction
-input int                InpMaxPositions    = 10;           // Max open positions (when OneTradeOnly=false)
-input int                InpTradeCooldownBars = 3;          // No new trade for N bars after one
+input int                InpMaxPositions    = 30;           // Max open positions (when OneTradeOnly=false)
+input int                InpTradeCooldownBars = 4;          // No new trade for N bars after one
+input double             InpDailyStopLossPct = 0.0;         // Daily stop % of balance (0=off; halt until next window)
 
 //==================== SESSION HOURS =================================
 // Hours are inclusive (8 and 16 = 08:00-16:59). End < start wraps midnight.
@@ -150,6 +166,14 @@ int    g_tradeCooldownBarsLeft = 0;
 bool   g_tradedThisBar         = false;
 string g_activeSource          = "none";
 string g_blockReason           = "";
+
+datetime g_pnlDay              = 0;
+int      g_pnlWindowId         = -1;
+datetime g_pnlFrom             = 0;
+double   g_windowClosedPnl     = 0.0;
+double   g_windowStartBalance  = 0.0;
+bool     g_dailyHalt           = false;
+bool     g_dailyHaltPrinted    = false;
 
 struct SwapPark
   {
@@ -271,9 +295,178 @@ datetime DayStartOf(const datetime t)
    return StructToTime(dt);
   }
 
+int CurrentSessionWindowId()
+  {
+   if(!InpUseSessionFilter)
+      return 0;
+   const int hour = SessionHourNow();
+   if(HourInWindow(hour, InpSession1StartHour, InpSession1EndHour))
+      return 1;
+   if(InpUseSession2 && HourInWindow(hour, InpSession2StartHour, InpSession2EndHour))
+      return 2;
+   return 0;
+  }
+
+datetime WindowStartOnDay(const datetime day, const int startHour, const int endHour)
+  {
+   datetime start = day + (datetime)startHour * 3600;
+   if(endHour < startHour)
+     {
+      const datetime now = SessionTimeNow();
+      if(now < day + (datetime)(endHour + 1) * 3600)
+         start -= 86400;
+     }
+   return start;
+  }
+
+datetime CurrentPnlFrom()
+  {
+   const datetime day = DayStartOf(SessionTimeNow());
+   const int wid = CurrentSessionWindowId();
+   if(!InpUseSessionFilter || wid <= 0)
+      return day;
+   if(wid == 1)
+      return WindowStartOnDay(day, InpSession1StartHour, InpSession1EndHour);
+   return WindowStartOnDay(day, InpSession2StartHour, InpSession2EndHour);
+  }
+
+double FloatingOurs()
+  {
+   double s = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      const ulong ticket = PositionGetTicket(i);
+      if(!IsOurPositionTicket(ticket))
+         continue;
+      s += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+     }
+   return s;
+  }
+
+double SumOurDealsSince(const datetime from)
+  {
+   double s = 0.0;
+   if(from <= 0)
+      return 0.0;
+   if(!HistorySelect(from, TimeCurrent() + 1))
+      return 0.0;
+   const int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+     {
+      const ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic)
+         continue;
+      s += HistoryDealGetDouble(ticket, DEAL_PROFIT)
+         + HistoryDealGetDouble(ticket, DEAL_SWAP)
+         + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+     }
+   return s;
+  }
+
+void SyncDailyPnlBucket()
+  {
+   const datetime day = DayStartOf(SessionTimeNow());
+   const int wid = CurrentSessionWindowId();
+   if(day == g_pnlDay && wid == g_pnlWindowId)
+      return;
+   g_pnlDay          = day;
+   g_pnlWindowId     = wid;
+   g_pnlFrom         = CurrentPnlFrom();
+   g_windowClosedPnl = 0.0;
+   g_windowStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_dailyHalt       = false;
+   g_dailyHaltPrinted = false;
+  }
+
+void RefreshWindowClosedPnl()
+  {
+   if(InpDailyStopLossPct <= 0.0)
+      return;
+   SyncDailyPnlBucket();
+   g_windowClosedPnl = SumOurDealsSince(g_pnlFrom);
+  }
+
+double WindowPnl()
+  {
+   SyncDailyPnlBucket();
+   return g_windowClosedPnl + FloatingOurs();
+  }
+
+double WindowLossPct()
+  {
+   if(g_windowStartBalance <= 0.0)
+      return 0.0;
+   const double pnl = WindowPnl();
+   if(pnl >= 0.0)
+      return 0.0;
+   return (-pnl / g_windowStartBalance) * 100.0;
+  }
+
+string DailyStopStatusText()
+  {
+   if(InpDailyStopLossPct <= 0.0)
+      return "OFF";
+   string txt = DoubleToString(WindowLossPct(), 2) + "/"
+                + DoubleToString(InpDailyStopLossPct, 2) + "% of balance";
+   if(g_pnlWindowId > 0)
+      txt += " W" + IntegerToString(g_pnlWindowId);
+   if(g_dailyHalt)
+      txt += " HALT until next window";
+   return txt;
+  }
+
+bool DailyStopOk()
+  {
+   if(InpDailyStopLossPct <= 0.0)
+      return true;
+   SyncDailyPnlBucket();
+   if(g_windowStartBalance <= 0.0)
+     {
+      g_blockReason = "daily stop: balance <= 0";
+      return false;
+     }
+   if(g_dailyHalt)
+     {
+      g_blockReason = "daily stop until next window (" + DailyStopStatusText() + ")";
+      return false;
+     }
+   const double lossPct = WindowLossPct();
+   if(lossPct >= InpDailyStopLossPct)
+     {
+      g_dailyHalt = true;
+      g_blockReason = "daily stop until next window (" + DailyStopStatusText() + ")";
+      if(!g_dailyHaltPrinted)
+        {
+         Print("Daily stop halt: window loss=", DoubleToString(lossPct, 2),
+               "% >= ", DoubleToString(InpDailyStopLossPct, 2),
+               "% of balance ", DoubleToString(g_windowStartBalance, 2),
+               " ", AccountInfoString(ACCOUNT_CURRENCY),
+               " | PnL=", DoubleToString(WindowPnl(), 2),
+               " | window=", IntegerToString(g_pnlWindowId),
+               " from=", TimeToString(g_pnlFrom, TIME_DATE|TIME_MINUTES),
+               " | no NEW entries until next session window");
+         g_dailyHaltPrinted = true;
+        }
+      return false;
+     }
+   return true;
+  }
+
+bool ReadSymbolInteger(const ENUM_SYMBOL_INFO_INTEGER prop, long &value)
+  {
+   return SymbolInfoInteger(_Symbol, prop, value);
+  }
+
 int TripleSwapRolloverDow()
   {
-   return (int)SymbolInfoInteger(_Symbol, SYMBOL_SWAP_ROLLOVER3DAY);
+   long rollover = 3;
+   if(!ReadSymbolInteger(SYMBOL_SWAP_ROLLOVER3DAYS, rollover))
+      return 3;
+   return (int)rollover;
   }
 
 string TripleSwapDowName(const int dow)
@@ -408,6 +601,23 @@ void ClearAllSwapParks(const string why)
    g_swapStatus = "cleared: " + why;
   }
 
+void DropSwapParksOfType(const ENUM_POSITION_TYPE type, const string why)
+  {
+   int dropped = 0;
+   for(int i = CountSwapParks() - 1; i >= 0; i--)
+     {
+      if(g_swapParks[i].type != type)
+         continue;
+      RemoveSwapParkAt(i);
+      dropped++;
+     }
+   if(dropped > 0)
+     {
+      PersistSwapParks();
+      Print("Triple-swap dropped ", dropped, " parked ", EnumToString(type), ": ", why);
+     }
+  }
+
 string TripleSwapStatusText()
   {
    if(!InpAvoidTripleSwap)
@@ -478,6 +688,10 @@ int SwapBonusFor(const ulong ticket)
 void ManageTripleSwapAvoidance();
 bool IsTradeLocked();
 void UpdateComment(const ENUM_SIGNAL_SRC signal, const bool locked);
+ENUM_TREND_DIR CurrentTrend();
+bool UseTakeProfit();
+void ManageTrendChangeExits();
+bool DailyStopOk();
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -498,11 +712,24 @@ int OnInit()
       Print("Momentum EMA period must be smaller than SMA period.");
       return INIT_PARAMETERS_INCORRECT;
      }
-   if(InpMaxBarsHold < 1)
+   if(InpMaxBarsHold < 0)
      {
-      Print("InpMaxBarsHold must be >= 1.");
+      Print("InpMaxBarsHold must be >= 0 (0=off, ride until trend flip).");
       return INIT_PARAMETERS_INCORRECT;
      }
+   if(InpDailyStopLossPct < 0.0)
+     {
+      Print("InpDailyStopLossPct must be >= 0 (0=off).");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpDailyStopLossPct > 100.0)
+     {
+      Print("InpDailyStopLossPct must be <= 100.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpDailyStopLossPct >= 20.0)
+      Print("WARNING: daily stop ", DoubleToString(InpDailyStopLossPct, 1),
+            "% of balance is very large.");
    if(InpMaxPositions < 1)
      {
       Print("InpMaxPositions must be >= 1.");
@@ -516,9 +743,14 @@ int OnInit()
      }
    if(InpUsePercentSLTP)
      {
-      if(InpStopLossPercent <= 0.0 || InpTakeProfitPercent <= 0.0)
+      if(InpStopLossPercent <= 0.0)
         {
-         Print("Percent SL/TP must be > 0 when InpUsePercentSLTP=true.");
+         Print("Percent SL must be > 0 when InpUsePercentSLTP=true.");
+         return INIT_PARAMETERS_INCORRECT;
+        }
+      if(InpTakeProfitPercent < 0.0)
+        {
+         Print("Percent TP must be >= 0 (0=none).");
          return INIT_PARAMETERS_INCORRECT;
         }
       if(InpStopLossPercent >= 5.0 || InpTakeProfitPercent >= 5.0)
@@ -526,9 +758,14 @@ int OnInit()
      }
    else
      {
-      if(InpStopLossPoints < 1 || InpTakeProfitPoints < 1)
+      if(InpStopLossPoints < 1)
         {
-         Print("SL/TP points must be >= 1 when InpUsePercentSLTP=false.");
+         Print("SL points must be >= 1 when InpUsePercentSLTP=false.");
+         return INIT_PARAMETERS_INCORRECT;
+        }
+      if(InpTakeProfitPoints < 0)
+        {
+         Print("TP points must be >= 0 (0=none, ride until trend flip / SL).");
          return INIT_PARAMETERS_INCORRECT;
         }
      }
@@ -584,6 +821,7 @@ int OnInit()
    ArrayResize(g_swapBonusTickets, 0);
    ArrayResize(g_swapBonusBars, 0);
    LoadSwapParks();
+   RefreshWindowClosedPnl();
 
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
       Print("WARNING: Terminal AutoTrading is disabled.");
@@ -595,12 +833,13 @@ int OnInit()
    string sltpMode;
    if(InpUsePercentSLTP)
       sltpMode = "PERCENT price SL=" + DoubleToString(InpStopLossPercent, 2)
-                 + "% TP=" + DoubleToString(InpTakeProfitPercent, 2) + "%";
+                 + "% TP=" + (UseTakeProfit() ? DoubleToString(InpTakeProfitPercent, 2) + "%" : "off");
    else
       sltpMode = "POINTS SL=" + IntegerToString(InpStopLossPoints)
-                 + " TP=" + IntegerToString(InpTakeProfitPoints);
+                 + " TP=" + (UseTakeProfit() ? IntegerToString(InpTakeProfitPoints) : "off");
 
-   Print("TF=", EnumToString(tf),
+   Print("MACD_RSI_Cross_BULL | TF=", EnumToString(tf),
+         " | trendFollow=", InpTrendFollowMode,
          " | P1=", InpUsePrio1, " P2=", InpUsePrio2, " P3=", InpUsePrio3,
          " | EMA", InpMomEmaPeriod, "/SMA", InpMomSmaPeriod,
          " | ADX filter=", InpUseAdxFilter,
@@ -608,21 +847,43 @@ int OnInit()
          " min=", DoubleToString(InpAdxMinLevel, 1),
          " DI=", InpAdxUseDiDirection,
          " | cooldown ", InpTradeCooldownBars, " bars",
-         " | maxHold ", InpMaxBarsHold, " bars",
+         " | maxHold ", (InpMaxBarsHold <= 0 ? "off" : IntegerToString(InpMaxBarsHold) + " bars"),
          " | lot=", DoubleToString(NormalizeVolume(InpLots), 2),
          " | oneTrade=", InpOneTradeOnly,
          " | maxPos=", EffectiveMaxPositions(),
          " | spreadInSLTP=", InpIncludeSpread,
          " | session=", (InpUseSessionFilter ? SessionStatusText() : "OFF"),
+         " | dailyStop=", (InpDailyStopLossPct > 0.0
+                           ? (DoubleToString(InpDailyStopLossPct, 2) + "% of balance")
+                           : "OFF"),
          " | tripleSwap=", TripleSwapStatusText(),
          " | ", sltpMode);
+
+   if(InpTrendFollowMode)
+      Print("TrendFollow ON: EMA", InpMomEmaPeriod, " vs SMA", InpMomSmaPeriod,
+            " is direction + close-on-flip. RSI/MACD only WITH that side. ",
+            "Downtrend shorts ride until EMA crosses back above SMA. ",
+            "Against-trend RSI/MACD do not flatten. TP=",
+            (UseTakeProfit() ? "on" : "off"),
+            " MaxBarsHold=", (InpMaxBarsHold <= 0 ? "off" : IntegerToString(InpMaxBarsHold)),
+            ". Reset inputs if a tester .set still has v1.90 hold=10 / TP=2000.");
+   else
+      Print("TrendFollow OFF: v1.90 fade stack. Opposite signal flattens. EMA/SMA is entry-cross only.");
+
+   if(InpDailyStopLossPct > 0.0)
+      Print("Daily stop ON: ", DoubleToString(InpDailyStopLossPct, 2),
+            "% of window-start balance (this EA closed profit+swap+commission + floating). ",
+            "Halt NEW entries until the next session window; SL/TP/hold/flip still run. ",
+            "0=off. Not % of price (that is InpStopLossPercent). Reset if an old money daily-stop value stuck.");
 
    if(InpAvoidTripleSwap)
      {
       Print("Triple-swap avoid ON (FX): close 1h before ",
             TripleSwapDowName(TripleSwapRolloverDow()),
             " rollover ", TimeToString(TripleSwapChargeTime(BrokerTimeNow()), TIME_DATE|TIME_MINUTES),
-            " and reopen next day if MaxBarsHold still valid.");
+            " and reopen next day if hold",
+            (InpTrendFollowMode ? " + EMA/SMA side" : ""),
+            " still valid.");
       EventSetTimer(30);
      }
 
@@ -658,10 +919,12 @@ void OnTick()
      {
       g_tradedThisBar = false;
       g_blockReason   = "";
+      RefreshWindowClosedPnl();
      }
 
    ManageTripleSwapAvoidance();
    ManageMaxBarHoldExits();
+   ManageTrendChangeExits();
 
    if(!newBar)
      {
@@ -670,8 +933,8 @@ void OnTick()
       return;
      }
 
-   if(InpUseSessionFilter && !IsInTradingSession())
-      ClearPending(); // drop overnight MACD waits so they cannot fire at session open
+   if((InpUseSessionFilter && !IsInTradingSession()) || !DailyStopOk())
+      ClearPending(); // drop MACD waits so they cannot fire after session/daily halt
 
    ENUM_SIGNAL_SRC signal = SIGNAL_NONE;
 
@@ -740,6 +1003,8 @@ bool IsTradeLocked()
       g_blockReason = "triple-swap window (FX rollover)";
       return true;
      }
+   if(!DailyStopOk())
+      return true;
    if(InpUseSessionFilter && !IsInTradingSession())
      {
       g_blockReason = "outside session (" + SessionStatusText() + ")";
@@ -801,8 +1066,8 @@ bool SignalIsSell(const ENUM_SIGNAL_SRC signal)
 ENUM_SIGNAL_SRC DetectExtremeSignal()
   {
    // Prio 1: closed-bar RSI in extreme zone. Retry every bar while still in
-   // the zone and armed — a single missed cross (session/ADX/cooldown) used
-   // to swallow the whole dip. Latch disarms only AFTER a successful open.
+   // the zone and armed. TrendFollow: OS=BUY only in UP, OB=SELL only in DOWN.
+   // Fade (TrendFollow OFF): OS=BUY / OB=SELL with no MA filter.
    if(!CopyRsi())
       return SIGNAL_NONE;
 
@@ -818,19 +1083,29 @@ ENUM_SIGNAL_SRC DetectExtremeSignal()
 
    if(g_extSellArmed && inOverbought)
      {
-      Print("Prio 1 SELL: closed RSI in overbought ",
-            DoubleToString(rsiPrev, 2), " -> ", DoubleToString(rsiCurr, 2),
-            " > OB=", DoubleToString(InpRsiOverbought, 1),
-            " period=", InpRsiPeriod);
-      return SIGNAL_EXT_SELL;
+      if(!InpTrendFollowMode || CurrentTrend() == TREND_DOWN)
+        {
+         Print("Prio 1 SELL: closed RSI in overbought ",
+               DoubleToString(rsiPrev, 2), " -> ", DoubleToString(rsiCurr, 2),
+               " > OB=", DoubleToString(InpRsiOverbought, 1),
+               " period=", InpRsiPeriod,
+               InpTrendFollowMode ? " | WITH downtrend" : " | fade");
+         return SIGNAL_EXT_SELL;
+        }
+      g_blockReason = "P1 SELL skipped: RSI OB but trend is not DOWN";
      }
    if(g_extBuyArmed && inOversold)
      {
-      Print("Prio 1 BUY: closed RSI in oversold ",
-            DoubleToString(rsiPrev, 2), " -> ", DoubleToString(rsiCurr, 2),
-            " < OS=", DoubleToString(InpRsiOversold, 1),
-            " period=", InpRsiPeriod);
-      return SIGNAL_EXT_BUY;
+      if(!InpTrendFollowMode || CurrentTrend() == TREND_UP)
+        {
+         Print("Prio 1 BUY: closed RSI in oversold ",
+               DoubleToString(rsiPrev, 2), " -> ", DoubleToString(rsiCurr, 2),
+               " < OS=", DoubleToString(InpRsiOversold, 1),
+               " period=", InpRsiPeriod,
+               InpTrendFollowMode ? " | WITH uptrend" : " | fade");
+         return SIGNAL_EXT_BUY;
+        }
+      g_blockReason = "P1 BUY skipped: RSI OS but trend is not UP";
      }
    return SIGNAL_NONE;
   }
@@ -839,8 +1114,9 @@ ENUM_SIGNAL_SRC DetectExtremeSignal()
 ENUM_SIGNAL_SRC DetectMomentumSignal()
   {
    // Prio 2: closed-bar EMA/SMA cross (bar[1] vs bar[2], never the forming bar).
-   // BUY  = EMA crossed SMA from below (golden cross).
-   // SELL = EMA crossed SMA from above (death cross).
+   // BUY  = EMA crossed SMA from below (golden cross) — uptrend start.
+   // SELL = EMA crossed SMA from above (death cross) — downtrend start.
+   // TrendFollow: this cross is the trend change; P1/P3 must already match [1].
    if(!CopyMomentum())
       return SIGNAL_NONE;
 
@@ -854,7 +1130,7 @@ ENUM_SIGNAL_SRC DetectMomentumSignal()
 
    if(crossUp)
      {
-      Print("Prio 2 BUY: EMA crossed SMA from below",
+      Print("Prio 2 BUY: EMA crossed SMA from below (trend start)",
             " | EMA[2]=", DoubleToString(emaPrev, _Digits),
             " SMA[2]=", DoubleToString(smaPrev, _Digits),
             " -> EMA[1]=", DoubleToString(emaCurr, _Digits),
@@ -863,7 +1139,7 @@ ENUM_SIGNAL_SRC DetectMomentumSignal()
      }
    if(crossDown)
      {
-      Print("Prio 2 SELL: EMA crossed SMA from above",
+      Print("Prio 2 SELL: EMA crossed SMA from above (trend start)",
             " | EMA[2]=", DoubleToString(emaPrev, _Digits),
             " SMA[2]=", DoubleToString(smaPrev, _Digits),
             " -> EMA[1]=", DoubleToString(emaCurr, _Digits),
@@ -890,6 +1166,9 @@ ENUM_SIGNAL_SRC DetectMacdSignal()
    const bool macdCrossDown = (macdPrev >= signalPrev && macdCurr < signalCurr);
    const bool macdBullish   = (macdCurr > signalCurr);
    const bool macdBearish   = (macdCurr < signalCurr);
+   const ENUM_TREND_DIR trend = CurrentTrend();
+   const bool trendAllowsBuy  = (!InpTrendFollowMode || trend == TREND_UP);
+   const bool trendAllowsSell = (!InpTrendFollowMode || trend == TREND_DOWN);
 
    // Confirmation: RSI already on the correct side OR a fresh cross through the level.
    // (Old logic required a fresh cross only — if RSI was already >50 on MACD cross, pending expired unused.)
@@ -901,27 +1180,45 @@ ENUM_SIGNAL_SRC DetectMacdSignal()
    if(!InpMacdRequireRsiConfirm)
      {
       ClearPending();
-      if(macdCrossUp)
+      if(macdCrossUp && trendAllowsBuy)
          return SIGNAL_MACD_BUY;
-      if(macdCrossDown)
+      if(macdCrossDown && trendAllowsSell)
          return SIGNAL_MACD_SELL;
+      if(InpTrendFollowMode && (macdCrossUp || macdCrossDown))
+         g_blockReason = "P3 MACD skipped: against EMA/SMA trend";
       return SIGNAL_NONE;
      }
 
    if(macdCrossUp)
      {
-      g_pendingDir  = 1;
-      g_pendingBars = 0;
+      if(trendAllowsBuy)
+        {
+         g_pendingDir  = 1;
+         g_pendingBars = 0;
+        }
+      else
+        {
+         ClearPending();
+         g_blockReason = "P3 MACD BUY pending skipped: trend not UP";
+        }
      }
    else if(macdCrossDown)
      {
-      g_pendingDir  = -1;
-      g_pendingBars = 0;
+      if(trendAllowsSell)
+        {
+         g_pendingDir  = -1;
+         g_pendingBars = 0;
+        }
+      else
+        {
+         ClearPending();
+         g_blockReason = "P3 MACD SELL pending skipped: trend not DOWN";
+        }
      }
 
-   if(g_pendingDir == 1 && macdBearish)
+   if(g_pendingDir == 1 && (macdBearish || !trendAllowsBuy))
       ClearPending();
-   if(g_pendingDir == -1 && macdBullish)
+   if(g_pendingDir == -1 && (macdBullish || !trendAllowsSell))
       ClearPending();
 
    ENUM_SIGNAL_SRC signal = SIGNAL_NONE;
@@ -968,11 +1265,36 @@ void ExecuteSignal(const ENUM_SIGNAL_SRC signal)
    if(!isBuy && !isSell)
       return;
 
-   // Opposite book is always flattened first — also when OneTradeOnly=false stacking.
+   if(InpTrendFollowMode && signal != SIGNAL_MOM_BUY && signal != SIGNAL_MOM_SELL)
+     {
+      const ENUM_TREND_DIR trend = CurrentTrend();
+      if(isBuy && trend != TREND_UP)
+        {
+         Print("TrendFollow blocked ", EnumToString(signal), ": EMA/SMA is not UP");
+         return;
+        }
+      if(isSell && trend != TREND_DOWN)
+        {
+         Print("TrendFollow blocked ", EnumToString(signal), ": EMA/SMA is not DOWN");
+         return;
+        }
+     }
+
+   // Opposite flatten: v1.90 always. TrendFollow: only the EMA/SMA cross (P2)
+   // may reverse. A MACD/RSI poke the other way is a pullback, not a trend change.
+   const bool flattenOpposite = (!InpTrendFollowMode
+                                 || signal == SIGNAL_MOM_BUY
+                                 || signal == SIGNAL_MOM_SELL);
    const bool hasOpposite = (isBuy && HasOurPosition(POSITION_TYPE_SELL))
                             || (isSell && HasOurPosition(POSITION_TYPE_BUY));
    if(hasOpposite)
      {
+      if(!flattenOpposite)
+        {
+         Print("TrendFollow: ignore opposite ", EnumToString(signal),
+               " — ride until EMA/SMA flip");
+         return;
+        }
       CloseAllOurPositions("contradictory " + EnumToString(signal));
       g_tradeCooldownBarsLeft = 0; // reverse is allowed immediately after flatten
       if((isBuy && HasOurPosition(POSITION_TYPE_SELL)) ||
@@ -1076,10 +1398,16 @@ void UpdateComment(const ENUM_SIGNAL_SRC signal, const bool locked)
                    : "OFF";
 
    Comment(
-      "TF=", EnumToString(SignalTF()), " | 1 open/bar; RSI confirm=MACD only\n",
-      "Prio1 RSI Min/Max: ", (InpUsePrio1 ? "ON" : "OFF"),
+      "MACD_RSI_Cross_BULL | TF=", EnumToString(SignalTF()),
+      InpTrendFollowMode ? " | TREND FOLLOW (ride until EMA/SMA flip)" : " | fade stack (v1.90)",
+      " | 1 open/bar; RSI confirm=MACD only\n",
+      "Prio1 RSI: ", (InpUsePrio1 ? "ON" : "OFF"),
+      InpTrendFollowMode ? " pullback WITH trend" : " Min/Max fade",
       " | Prio2 EMA", InpMomEmaPeriod, "/SMA", InpMomSmaPeriod, ": ", (InpUsePrio2 ? "ON" : "OFF"),
       " | Prio3 MACD: ", (InpUsePrio3 ? "ON" : "OFF"), "\n",
+      "Trend: ", EnumToString(CurrentTrend()),
+      " | EMA=", DoubleToString(emaNow, _Digits),
+      "  SMA=", DoubleToString(smaNow, _Digits), "\n",
       "ADX filter: ", adxTxt,
       " | ADX=", DoubleToString(adxNow, 1),
       " +DI=", DoubleToString(plusDiNow, 1),
@@ -1093,14 +1421,13 @@ void UpdateComment(const ENUM_SIGNAL_SRC signal, const bool locked)
       " OS/OB=", DoubleToString(InpRsiOversold, 0), "/", DoubleToString(InpRsiOverbought, 0),
       " closed[1]=", DoubleToString(rsiClosed, 2),
       " form[0]=", DoubleToString(rsiForm, 2),
-      (rsiClosed < InpRsiOversold ? " ZONE-BUY" : ""),
-      (rsiClosed > InpRsiOverbought ? " ZONE-SELL" : ""),
+      (rsiClosed < InpRsiOversold ? " ZONE-OS" : ""),
+      (rsiClosed > InpRsiOverbought ? " ZONE-OB" : ""),
       " armedB/S=", (g_extBuyArmed ? "Y" : "N"), "/", (g_extSellArmed ? "Y" : "N"), "\n",
-      "  EMA=", DoubleToString(emaNow, _Digits),
-      "  SMA=", DoubleToString(smaNow, _Digits), "\n",
       "Pending MACD: ", pendingTxt, "\n",
       "Session: ", (InpUseSessionFilter ? ("ON " + SessionStatusText()
                    + (IsInTradingSession() ? " OPEN" : " CLOSED")) : "OFF"), "\n",
+      "Daily stop: ", DailyStopStatusText(), "\n",
       "Triple swap: ", TripleSwapStatusText(), "\n",
       "Cooldown bars: ", IntegerToString(g_tradeCooldownBarsLeft),
       "/", IntegerToString(InpTradeCooldownBars),
@@ -1110,8 +1437,12 @@ void UpdateComment(const ENUM_SIGNAL_SRC signal, const bool locked)
       " BUY=", IntegerToString(CountOurPositionsOf(POSITION_TYPE_BUY)),
       " SELL=", IntegerToString(CountOurPositionsOf(POSITION_TYPE_SELL)), "\n",
       "SL/TP: ", InpUsePercentSLTP
-         ? ("%" + DoubleToString(InpStopLossPercent, 2) + "/" + DoubleToString(InpTakeProfitPercent, 2) + " of price")
-         : (IntegerToString(InpStopLossPoints) + "/" + IntegerToString(InpTakeProfitPoints) + " points"),
+         ? ("%" + DoubleToString(InpStopLossPercent, 2) + "/"
+            + (UseTakeProfit() ? DoubleToString(InpTakeProfitPercent, 2) : "off")
+            + " of price")
+         : (IntegerToString(InpStopLossPoints) + "/"
+            + (UseTakeProfit() ? IntegerToString(InpTakeProfitPoints) : "off")
+            + " points"),
       InpIncludeSpread ? " +spread" : "",
       " | spread=", DoubleToString(CurrentSpreadPoints(), 1), " pts"
    );
@@ -1179,14 +1510,18 @@ string HoldStatusText()
       list += "#" + IntegerToString((long)ticket) + "(" + IntegerToString(held) + ")";
      }
    if(n <= 0)
-      return ("0/" + IntegerToString(InpMaxBarsHold));
+      return (InpMaxBarsHold <= 0 ? "off (until flip)" : ("0/" + IntegerToString(InpMaxBarsHold)));
+   if(InpMaxBarsHold <= 0)
+      return ("held " + IntegerToString(oldest) + " (no time stop) " + list);
    return (IntegerToString(oldest) + "/" + IntegerToString(InpMaxBarsHold) + " " + list);
   }
 
 //+------------------------------------------------------------------+
 void ManageMaxBarHoldExits()
   {
-   const int maxHold = MathMax(InpMaxBarsHold, 1);
+   if(InpMaxBarsHold <= 0)
+      return;
+   const int maxHold = InpMaxBarsHold;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       const ulong ticket = PositionGetTicket(i);
@@ -1251,6 +1586,78 @@ bool CopyMomentum()
    if(!CopySeriesBuffer(g_smaHandle, 0, 3, g_sma))
       return false;
    return true;
+  }
+
+//+------------------------------------------------------------------+
+bool UseTakeProfit()
+  {
+   if(InpUsePercentSLTP)
+      return (InpTakeProfitPercent > 0.0);
+   return (InpTakeProfitPoints > 0);
+  }
+
+//+------------------------------------------------------------------+
+ENUM_TREND_DIR CurrentTrend()
+  {
+   if(!CopyMomentum())
+      return TREND_FLAT;
+   const double ema = g_ema[1];
+   const double sma = g_sma[1];
+   if(ema > sma)
+      return TREND_UP;
+   if(ema < sma)
+      return TREND_DOWN;
+   return TREND_FLAT;
+  }
+
+//+------------------------------------------------------------------+
+void ManageTrendChangeExits()
+  {
+   if(!InpTrendFollowMode)
+      return;
+   if(!HasAnyOurPosition() && !HasSwapParkExposure())
+      return;
+   if(!CopyMomentum())
+      return;
+
+   const double ema = g_ema[1];
+   const double sma = g_sma[1];
+   const bool trendDown = (ema < sma);
+   const bool trendUp   = (ema > sma);
+   if(!trendDown && !trendUp)
+      return;
+
+   const int digits = _Digits;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      const ulong ticket = PositionGetTicket(i);
+      if(!IsOurPositionTicket(ticket))
+         continue;
+
+      const ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      const bool against = ((type == POSITION_TYPE_BUY && trendDown) ||
+                            (type == POSITION_TYPE_SELL && trendUp));
+      if(!against)
+         continue;
+
+      if(!g_trade.PositionClose(ticket))
+         Print("Trend-flip close failed: ", g_trade.ResultRetcode(), " ",
+               g_trade.ResultRetcodeDescription(), " ticket=", ticket);
+      else
+        {
+         Print("Position closed: EMA/SMA trend flip ticket=", ticket,
+               " type=", EnumToString(type),
+               " EMA=", DoubleToString(ema, digits),
+               " SMA=", DoubleToString(sma, digits));
+         RemoveSwapBonus(ticket);
+        }
+     }
+
+   if(trendDown)
+      DropSwapParksOfType(POSITION_TYPE_BUY, "EMA/SMA trend DOWN");
+   else if(trendUp)
+      DropSwapParksOfType(POSITION_TYPE_SELL, "EMA/SMA trend UP");
   }
 
 //+------------------------------------------------------------------+
@@ -1435,8 +1842,10 @@ double BrokerStopIndentPrice()
    const double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(point <= 0.0)
       return TickSize();
-   const long stops  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   const long freeze = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   long stops = 0;
+   long freeze = 0;
+   ReadSymbolInteger(SYMBOL_TRADE_STOPS_LEVEL, stops);
+   ReadSymbolInteger(SYMBOL_TRADE_FREEZE_LEVEL, freeze);
    return (double)MathMax(stops, freeze) * point;
   }
 
@@ -1484,17 +1893,27 @@ bool StopsWouldTriggerNow(const ENUM_ORDER_TYPE orderType, const double sl, cons
   {
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   if(bid <= 0.0 || ask <= 0.0 || sl <= 0.0 || tp <= 0.0)
+   if(bid <= 0.0 || ask <= 0.0 || sl <= 0.0)
       return true;
    if(orderType == ORDER_TYPE_BUY)
-      return (sl >= bid || tp <= bid);
-   return (sl <= ask || tp >= ask);
+     {
+      if(sl >= bid)
+         return true;
+      if(tp > 0.0 && tp <= bid)
+         return true;
+      return false;
+     }
+   if(sl <= ask)
+      return true;
+   if(tp > 0.0 && tp >= ask)
+      return true;
+   return false;
   }
 
 //+------------------------------------------------------------------+
 void CalcSLTPFromEntry(const ENUM_ORDER_TYPE orderType, const double entry, double &sl, double &tp)
   {
-   const int    digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   const int    digits  = _Digits;
    const double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    const double tick    = TickSize();
    const double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -1512,16 +1931,19 @@ void CalcSLTPFromEntry(const ENUM_ORDER_TYPE orderType, const double entry, doub
 
    double slDist = 0.0;
    double tpDist = 0.0;
+   const bool wantTp = UseTakeProfit();
 
    if(InpUsePercentSLTP)
      {
       slDist = entry * (MathMax(InpStopLossPercent, 0.01) / 100.0);
-      tpDist = entry * (MathMax(InpTakeProfitPercent, 0.01) / 100.0);
+      if(wantTp)
+         tpDist = entry * (MathMax(InpTakeProfitPercent, 0.01) / 100.0);
      }
    else
      {
       slDist = (double)MathMax(InpStopLossPoints, 1) * point;
-      tpDist = (double)MathMax(InpTakeProfitPoints, 1) * point;
+      if(wantTp)
+         tpDist = (double)MathMax(InpTakeProfitPoints, 1) * point;
      }
 
    // Chart is Bid. BUY opens at Ask / SELL closes at Ask, so raw SL from entry
@@ -1530,7 +1952,8 @@ void CalcSLTPFromEntry(const ENUM_ORDER_TYPE orderType, const double entry, doub
    if(InpIncludeSpread && spreadPx > 0.0)
      {
       slDist += spreadPx;
-      tpDist += spreadPx;
+      if(wantTp)
+         tpDist += spreadPx;
      }
 
    if(slDist < minFromEntry)
@@ -1541,7 +1964,7 @@ void CalcSLTPFromEntry(const ENUM_ORDER_TYPE orderType, const double entry, doub
             " + stops/freeze + buffer) — old SL would close on open");
       slDist = minFromEntry;
      }
-   if(tpDist < minFromEntry)
+   if(wantTp && tpDist < minFromEntry)
      {
       Print("TP distance widened from ", DoubleToString(tpDist, digits),
             " to ", DoubleToString(minFromEntry, digits),
@@ -1552,38 +1975,44 @@ void CalcSLTPFromEntry(const ENUM_ORDER_TYPE orderType, const double entry, doub
    if(orderType == ORDER_TYPE_BUY)
      {
       sl = FloorToTick(entry - slDist);
-      tp = CeilToTick(entry + tpDist);
       const double slMax = FloorToTick(bid - minFromClose);
-      const double tpMin = CeilToTick(MathMax(ask, bid) + minFromClose);
       if(sl > slMax)
          sl = slMax;
-      if(tp < tpMin)
-         tp = tpMin;
       if(sl >= bid)
          sl = FloorToTick(bid - MathMax(minFromClose, tick));
-      if(tp <= bid || tp <= entry)
-         tp = CeilToTick(MathMax(entry, bid) + MathMax(minFromClose, tick));
+      if(wantTp)
+        {
+         tp = CeilToTick(entry + tpDist);
+         const double tpMin = CeilToTick(MathMax(ask, bid) + minFromClose);
+         if(tp < tpMin)
+            tp = tpMin;
+         if(tp <= bid || tp <= entry)
+            tp = CeilToTick(MathMax(entry, bid) + MathMax(minFromClose, tick));
+        }
      }
    else
      {
       sl = CeilToTick(entry + slDist);
-      tp = FloorToTick(entry - tpDist);
       const double slMin = CeilToTick(ask + minFromClose);
-      const double tpMax = FloorToTick(MathMin(bid, ask) - minFromClose);
       if(sl < slMin)
          sl = slMin;
-      if(tp > tpMax)
-         tp = tpMax;
       if(sl <= ask)
          sl = CeilToTick(ask + MathMax(minFromClose, tick));
-      if(tp >= ask || tp >= entry)
-         tp = FloorToTick(MathMin(entry, ask) - MathMax(minFromClose, tick));
+      if(wantTp)
+        {
+         tp = FloorToTick(entry - tpDist);
+         const double tpMax = FloorToTick(MathMin(bid, ask) - minFromClose);
+         if(tp > tpMax)
+            tp = tpMax;
+         if(tp >= ask || tp >= entry)
+            tp = FloorToTick(MathMin(entry, ask) - MathMax(minFromClose, tick));
+        }
      }
 
    sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
+   tp = wantTp ? NormalizeDouble(tp, digits) : 0.0;
 
-   if(StopsWouldTriggerNow(orderType, sl, tp) || sl <= 0.0 || tp <= 0.0)
+   if(StopsWouldTriggerNow(orderType, sl, tp) || sl <= 0.0 || (wantTp && tp <= 0.0))
      {
       Print("CalcSLTP rejected suicide levels ", EnumToString(orderType),
             " entry=", DoubleToString(entry, digits),
@@ -1599,9 +2028,9 @@ void CalcSLTPFromEntry(const ENUM_ORDER_TYPE orderType, const double entry, doub
    Print("CalcSLTP ", EnumToString(orderType),
          " entry=", DoubleToString(entry, digits),
          " sl=", DoubleToString(sl, digits),
-         " tp=", DoubleToString(tp, digits),
+         " tp=", (wantTp ? DoubleToString(tp, digits) : "off"),
          " slDist=", DoubleToString(slDist, digits),
-         " tpDist=", DoubleToString(tpDist, digits),
+         " tpDist=", (wantTp ? DoubleToString(tpDist, digits) : "off"),
          " spreadPts=", DoubleToString(CurrentSpreadPoints(), 1),
          " includeSpread=", InpIncludeSpread,
          " mode=", (InpUsePercentSLTP ? "percent" : "points"));
@@ -1627,11 +2056,12 @@ bool EnsurePositionSLTP(const ulong ticket, const ENUM_POSITION_TYPE type)
 
    double curSL = PositionGetDouble(POSITION_SL);
    double curTP = PositionGetDouble(POSITION_TP);
-   if(curSL > 0.0 && curTP > 0.0)
+   const bool wantTp = UseTakeProfit();
+   if(curSL > 0.0 && (!wantTp || curTP > 0.0))
      {
       Print("SL/TP OK ticket=", ticket,
             " SL=", DoubleToString(curSL, _Digits),
-            " TP=", DoubleToString(curTP, _Digits));
+            " TP=", (wantTp ? DoubleToString(curTP, _Digits) : "off"));
       return true;
      }
 
@@ -1639,7 +2069,7 @@ bool EnsurePositionSLTP(const ulong ticket, const ENUM_POSITION_TYPE type)
    const double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
    double sl, tp;
    CalcSLTPFromEntry(orderType, openPrice, sl, tp);
-   if(sl <= 0.0 || tp <= 0.0)
+   if(sl <= 0.0 || (wantTp && tp <= 0.0))
      {
       Print("EnsurePositionSLTP: CalcSLTP returned zero levels for ticket ", ticket);
       return false;
@@ -1647,18 +2077,23 @@ bool EnsurePositionSLTP(const ulong ticket, const ENUM_POSITION_TYPE type)
 
    if(curSL > 0.0)
       sl = curSL;
-   if(curTP > 0.0)
-      tp = curTP;
+   if(wantTp)
+     {
+      if(curTP > 0.0)
+         tp = curTP;
+     }
+   else
+      tp = 0.0;
 
-   const int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   const int digits = _Digits;
    sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
+   tp = wantTp ? NormalizeDouble(tp, digits) : 0.0;
 
    Print("SL/TP missing on ticket=", ticket,
          " curSL=", DoubleToString(curSL, digits),
          " curTP=", DoubleToString(curTP, digits),
          " -> modify SL=", DoubleToString(sl, digits),
-         " TP=", DoubleToString(tp, digits));
+         " TP=", (wantTp ? DoubleToString(tp, digits) : "off"));
 
    if(!g_trade.PositionModify(ticket, sl, tp))
      {
@@ -1673,7 +2108,7 @@ bool EnsurePositionSLTP(const ulong ticket, const ENUM_POSITION_TYPE type)
 
    curSL = PositionGetDouble(POSITION_SL);
    curTP = PositionGetDouble(POSITION_TP);
-   const bool ok = (curSL > 0.0 && curTP > 0.0);
+   const bool ok = (curSL > 0.0 && (!wantTp || curTP > 0.0));
    Print(ok ? "PositionModify OK" : "PositionModify still missing levels",
          " ticket=", ticket,
          " SL=", DoubleToString(curSL, digits),
@@ -1691,7 +2126,9 @@ bool IsInvalidStopsRetcode(const uint retcode)
 
 bool SwapHoldStillValid(const int barsHeld)
   {
-   return (barsHeld < MathMax(InpMaxBarsHold, 1));
+   if(InpMaxBarsHold <= 0)
+      return true;
+   return (barsHeld < InpMaxBarsHold);
   }
 
 bool SwapParkStillApplicable(const SwapPark &park)
@@ -1705,6 +2142,20 @@ bool SwapParkStillApplicable(const SwapPark &park)
      {
       Print("Triple-swap reopen skipped: MaxBarsHold exhausted");
       return false;
+     }
+   if(InpTrendFollowMode)
+     {
+      const ENUM_TREND_DIR trend = CurrentTrend();
+      if(park.type == POSITION_TYPE_BUY && trend != TREND_UP)
+        {
+         Print("Triple-swap reopen skipped: EMA/SMA not UP");
+         return false;
+        }
+      if(park.type == POSITION_TYPE_SELL && trend != TREND_DOWN)
+        {
+         Print("Triple-swap reopen skipped: EMA/SMA not DOWN");
+         return false;
+        }
      }
    return true;
   }
@@ -1726,7 +2177,7 @@ bool OpenSwapReopen(const SwapPark &park)
    const ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    double sl, tp;
    CalcSLTP(orderType, sl, tp);
-   if(sl <= 0.0 || tp <= 0.0)
+   if(sl <= 0.0 || (UseTakeProfit() && tp <= 0.0))
      {
       Print("Triple-swap reopen blocked: invalid SL/TP");
       return false;
@@ -1739,8 +2190,8 @@ bool OpenSwapReopen(const SwapPark &park)
       return false;
      }
 
-   const string comment = isBuy ? "MACD RSI SWAP REOPEN BUY"
-                                : "MACD RSI SWAP REOPEN SELL";
+   const string comment = isBuy ? "MACD RSI BULL SWAP REOPEN BUY"
+                                : "MACD RSI BULL SWAP REOPEN SELL";
    bool ok = isBuy
              ? g_trade.Buy(lots, _Symbol, 0.0, sl, tp, comment)
              : g_trade.Sell(lots, _Symbol, 0.0, sl, tp, comment);
@@ -1836,6 +2287,11 @@ void TryReopenSwapParks()
       g_swapStatus = "waiting session to reopen";
       return;
      }
+   if(!DailyStopOk())
+     {
+      g_swapStatus = "daily stop halt";
+      return;
+     }
 
    int opened = 0;
    for(int i = CountSwapParks() - 1; i >= 0; i--)
@@ -1905,7 +2361,7 @@ void OpenBuy(const string comment, const bool isExtreme)
 
    double sl, tp;
    CalcSLTP(ORDER_TYPE_BUY, sl, tp);
-   if(sl <= 0.0 || tp <= 0.0)
+   if(sl <= 0.0 || (UseTakeProfit() && tp <= 0.0))
      {
       Print("OpenBuy blocked: invalid SL/TP after CalcSLTP");
       return;
@@ -1963,7 +2419,7 @@ void OpenSell(const string comment, const bool isExtreme)
 
    double sl, tp;
    CalcSLTP(ORDER_TYPE_SELL, sl, tp);
-   if(sl <= 0.0 || tp <= 0.0)
+   if(sl <= 0.0 || (UseTakeProfit() && tp <= 0.0))
      {
       Print("OpenSell blocked: invalid SL/TP after CalcSLTP");
       return;
@@ -2028,5 +2484,25 @@ ulong FindNewestOurPosition(const ENUM_POSITION_TYPE type)
         }
      }
    return bestTicket;
+  }
+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+  {
+   if(request.volume < 0.0 || result.volume < 0.0)
+      return;
+   if(InpDailyStopLossPct <= 0.0)
+      return;
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   const ulong deal = trans.deal;
+   if(deal == 0 || !HistoryDealSelect(deal))
+      return;
+   if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol)
+      return;
+   if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagic)
+      return;
+   RefreshWindowClosedPnl();
   }
 //+------------------------------------------------------------------+

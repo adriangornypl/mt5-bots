@@ -25,7 +25,7 @@ Closed bar `[1]`: Fast EMA(`InpEmaFast`=81) vs Slow EMA(`InpEmaSlow`=255).
 | Stoch | K/D cross `[2]→[1]` **and** %K at/through OS (20) for BUY / OB (80) for SELL. Price field `STO_LOWHIGH` to match MT5 chart. | Same K/D cross, any zone |
 | RSI | Leave OS/OB: zone on closed `[2]` **or** `[3]`, `[1]` already outside and still rising (BUY) / falling (SELL). Copy 4 RSI bars. | Mid-50 cross only |
 
-ADX (`InpUseAdxFilter` default **ON**, min 15): **strength only** — no +DI/−DI direction gate (unlike MACD_RSI_Cross). Weak ADX blocks osc opens in an EMA trend. News-forced entries skip ADX.
+ADX (`InpUseAdxFilter` default **ON**, min 15): **strength only** — no +DI/−DI direction gate (unlike MACD_RSI_Cross_Bull). Weak ADX blocks osc opens in an EMA trend. News-forced entries skip ADX.
 
 At most **one new entry per bar**. Never add on the same bar as the last open.
 
@@ -41,7 +41,7 @@ Independent of RequireExtreme/ADX (those only gate **entries**). While BUY(s) op
 
 ## News (default OFF)
 
-Same JSON shape as Event_Scalp: paginated `{date d-m-Y H:i:s, signal}`. Needs WebRequest URL allow-list.
+Paginated `{date d-m-Y H:i:s, signal}`. Needs WebRequest URL allow-list. Event_Scalp does **not** share this path.
 
 - API OFF → no news block.
 - Backfill: remember last actionable for later flips; **do not** arm live bias.
@@ -60,7 +60,7 @@ Points only (no percent mode). Widened to broker min stop distance. Invalid stop
 
 ## CopyBuffer pitfall
 
-Unlike MACD_RSI_Cross, this EA **does not** re-apply `ArraySetAsSeries` after every `CopyBuffer`. Arrays are series-flagged in `OnInit`. If a future change sees inverted `[1]`/`[2]`, re-apply series after copy (MACD pattern). RSI extreme **requires 4** copied values (`g_rsi[3]`).
+Unlike MACD_RSI_Cross_Bull, this EA **does not** re-apply `ArraySetAsSeries` after every `CopyBuffer`. Arrays are series-flagged in `OnInit`. If a future change sees inverted `[1]`/`[2]`, re-apply series after copy (MACD pattern). RSI extreme **requires 4** copied values (`g_rsi[3]`).
 
 ## Pitfalls (do not reintroduce)
 
@@ -77,7 +77,7 @@ Unlike MACD_RSI_Cross, this EA **does not** re-apply `ArraySetAsSeries` after ev
 
 ## Other robots
 
-Leave `Event_Scalp.mq5` and `MACD_RSI_Cross.mq5` alone unless asked. News JSON is shared with Event_Scalp. Triple-swap / session “entries only” idea is shared with MACD_RSI_Cross.
+Leave `Event_Scalp.mq5` and `MACD_RSI_Cross_Bull.mq5` alone unless asked. News JSON is Stochastic-only (not Scalp). Triple-swap / session “entries only” idea is shared with MACD_RSI_Cross_Bull.
 
 ## Versions (short)
 
